@@ -416,6 +416,23 @@ func (p *CapturePreparation) Close() {
 	}
 }
 
+// hasGstElementProperty permits using newer plugin controls without making
+// older, otherwise working installations fail GStreamer pipeline parsing.
+func hasGstElementProperty(element, property string) bool {
+	output, err := exec.Command("gst-inspect-1.0", element).Output()
+	return err == nil && gstInspectionHasProperty(string(output), property)
+}
+
+func gstInspectionHasProperty(output, property string) bool {
+	for _, line := range strings.Split(output, "\n") {
+		name, _, ok := strings.Cut(line, ":")
+		if ok && strings.TrimSpace(name) == property {
+			return true
+		}
+	}
+	return false
+}
+
 func hasGstElement(name string) bool {
 	return exec.Command("gst-inspect-1.0", name).Run() == nil
 }
@@ -725,19 +742,40 @@ func frameIntervalMillis(fps int) int {
 	return max(1, 1000/fps)
 }
 
-func pipeWireVideoSourceStage(fd int, nodeID uint32, fps int) gstStage {
-	return gstStage{
+type pipeWireSourceOptions struct {
+	importDMABuf bool
+	repeatFrames bool
+	disableClock bool
+}
+
+func pipeWireVideoSourceStage(fd int, nodeID uint32, fps int, options pipeWireSourceOptions) gstStage {
+	keepalive := 0
+	if options.repeatFrames {
+		keepalive = frameIntervalMillis(fps)
+	}
+	stage := gstStage{
 		"pipewiresrc",
 		fmt.Sprintf("fd=%d", fd),
 		fmt.Sprintf("path=%d", nodeID),
 		"do-timestamp=true",
-		fmt.Sprintf("keepalive-time=%d", frameIntervalMillis(fps)),
-		// The compositor and pipewiresrc's keepalive path both retain the latest
-		// GstBuffer. With a small portal pool that can keep every PipeWire buffer
-		// checked out and freeze screencopy. Copying here returns the portal buffer
-		// as soon as pipewiresrc pulls it while downstream retains only the copy.
-		"always-copy=true",
+
+		fmt.Sprintf("keepalive-time=%d", keepalive),
+		// DMA-BUF memory may not support gst_memory_copy. Let vapostproc
+		// import it before the software compositor retains its output. For
+		// the software path, copy here to release the small portal pool early.
+		fmt.Sprintf("always-copy=%t", !options.importDMABuf),
 	}
+	if options.disableClock {
+		// The PipeWire clock can stop waking live-source/aggregator waits. Let
+		// GStreamer use its continuously advancing system clock instead.
+		stage = append(stage, "provide-clock=false")
+	}
+	if options.importDMABuf {
+		// Leave room for in-flight imports while the source and consumers retain
+		// buffers. A one-buffer pool can stall after the first captured image.
+		stage = append(stage, "min-buffers=8")
+	}
+	return stage
 }
 
 func lowLatencyVideoQueueStage() gstStage {
@@ -853,13 +891,24 @@ func startPreparedWaylandCapture(ctx context.Context, cfg CaptureConfig, encoder
 	// The encoded dimensions are capped to the receiver's advertised display size
 	// when available. The actual result is read back from the codec SPS downstream.
 	const pwFdNum = 3
-	source := pipeWireVideoSourceStage(pwFdNum, nodeID, fps)
-
+	importDMABuf := hasGstElement("vapostproc")
 	hasCompositor := streamSize[0] > 0 && streamSize[1] > 0 && hasGstElement("compositor")
+	// The compositor already repeats idle frames. Avoid retaining another
+	// source buffer for PipeWire keepalive when that downstream stage is present.
+	disableClock := hasGstElementProperty("pipewiresrc", "provide-clock")
+	if !disableClock {
+		log.Printf("[CAPTURE] pipewiresrc lacks provide-clock; retaining its legacy clock (update the PipeWire GStreamer plugin if capture freezes)")
+	}
+	source := pipeWireVideoSourceStage(pwFdNum, nodeID, fps, pipeWireSourceOptions{
+		importDMABuf: importDMABuf,
+		repeatFrames: !hasCompositor,
+		disableClock: disableClock,
+	})
 
 	var beforeConvert []gstStage
-	if hasGstElement("vapostproc") {
-		beforeConvert = append(beforeConvert, gstStage{"vapostproc"})
+	if importDMABuf {
+		// Force a new GPU output buffer so downstream cannot retain the portal pool.
+		beforeConvert = append(beforeConvert, gstStage{"vapostproc", "disable-passthrough=true"})
 	} else {
 		log.Printf("[CAPTURE] vapostproc unavailable, using software conversion")
 	}

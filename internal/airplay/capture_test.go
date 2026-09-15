@@ -362,7 +362,7 @@ func TestFrameIntervalMillis(t *testing.T) {
 }
 
 func TestPipeWireVideoSourceCopiesPortalBuffers(t *testing.T) {
-	got := pipeWireVideoSourceStage(3, 42, 30)
+	got := pipeWireVideoSourceStage(3, 42, 30, pipeWireSourceOptions{repeatFrames: true, disableClock: true})
 	want := gstStage{
 		"pipewiresrc",
 		"fd=3",
@@ -370,6 +370,7 @@ func TestPipeWireVideoSourceCopiesPortalBuffers(t *testing.T) {
 		"do-timestamp=true",
 		"keepalive-time=33",
 		"always-copy=true",
+		"provide-clock=false",
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("PipeWire source stage = %v, want %v", got, want)
@@ -808,5 +809,57 @@ func TestDetectGstEncoderSelectionContract(t *testing.T) {
 				t.Fatalf("encoder = %#v, want %s", encoder, test.wantEncoder)
 			}
 		})
+	}
+}
+
+func TestPipeWireDMABufSourceDoesNotCopyUnmappableMemory(t *testing.T) {
+	stage := pipeWireVideoSourceStage(3, 42, 30, pipeWireSourceOptions{importDMABuf: true, disableClock: true})
+	if !strings.Contains(strings.Join(stage, " "), "always-copy=false") {
+		t.Fatalf("DMA-BUF import must not request CPU copying: %v", stage)
+	}
+}
+
+func TestPipeWireDMABufPoolAndIdleFrameOwnership(t *testing.T) {
+	stage := strings.Join(pipeWireVideoSourceStage(3, 42, 30, pipeWireSourceOptions{importDMABuf: true, disableClock: true}), " ")
+	if !strings.Contains(stage, "min-buffers=8") || !strings.Contains(stage, "keepalive-time=0") {
+		t.Fatalf("portal buffers may be exhausted: %s", stage)
+	}
+	fallback := strings.Join(pipeWireVideoSourceStage(3, 42, 30, pipeWireSourceOptions{importDMABuf: true, repeatFrames: true, disableClock: true}), " ")
+	if !strings.Contains(fallback, "keepalive-time=33") {
+		t.Fatalf("missing idle frames without compositor: %s", fallback)
+	}
+}
+
+func TestPipeWireSourceDoesNotProvideDamageDrivenPipelineClock(t *testing.T) {
+	for _, importDMABuf := range []bool{false, true} {
+		for _, repeatFrames := range []bool{false, true} {
+			stage := strings.Join(pipeWireVideoSourceStage(3, 42, 30, pipeWireSourceOptions{importDMABuf: importDMABuf, repeatFrames: repeatFrames, disableClock: true}), " ")
+			if !strings.Contains(stage, "provide-clock=false") {
+				t.Fatalf("source clock can stall live output: %s", stage)
+			}
+		}
+	}
+}
+
+func TestPipeWireLegacyPluginDoesNotGetUnsupportedClockProperty(t *testing.T) {
+	stage := strings.Join(pipeWireVideoSourceStage(3, 42, 30, pipeWireSourceOptions{repeatFrames: true}), " ")
+	if strings.Contains(stage, "provide-clock=") {
+		t.Fatalf("unsupported property: %s", stage)
+	}
+}
+
+func TestGstInspectionPropertyDetection(t *testing.T) {
+	for _, tt := range []struct {
+		output string
+		want   bool
+	}{
+		{"  provide-clock       : Provide a clock\n    flags: readable, writable", true},
+		{"  description: Supports provide-clock on newer releases", false},
+		{"  provide-clock-extra : unrelated property", false},
+		{"", false},
+	} {
+		if got := gstInspectionHasProperty(tt.output, "provide-clock"); got != tt.want {
+			t.Errorf("property detection=%v want=%v for %q", got, tt.want, tt.output)
+		}
 	}
 }

@@ -49,6 +49,17 @@ You can also install from the AUR:
 - [`doubletake-git`](https://aur.archlinux.org/packages/doubletake-git) (latest from git)
 - [`doubletake-bin`](https://aur.archlinux.org/packages/doubletake-bin) (prebuilt binary package)
 
+### Wayland capture stability
+
+The VA-API capture path imports portal DMA-BUF frames without forcing a CPU
+copy, uses separate postprocessing buffers, and reserves enough source buffers
+for frames in flight. The compositor repeats idle frames. When the installed
+PipeWire GStreamer plugin supports `provide-clock`, doubletake disables that
+clock provider so the pipeline uses GStreamer's system clock; this avoids a
+clock-wait stall that can freeze video while audio continues. Older plugins
+retain their legacy behavior and produce an upgrade hint if the control is
+unavailable.
+
 ## Tested Devices
 
 These are devices that have been tested with doubletake. If there are devices not listed here that you have confirmed working or non-functional, please open an issue.
