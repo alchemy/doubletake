@@ -862,3 +862,25 @@ func rtspStatusText(status int) string {
 		return "Status"
 	}
 }
+
+func TestManagedSetupStopsBeforeAdvertisingPortsWhenHelperUnavailable(t *testing.T) {
+	t.Setenv("DBUS_SYSTEM_BUS_ADDRESS", "unix:path="+t.TempDir()+"/missing-bus")
+	sender, receiver := net.Pipe()
+	defer sender.Close()
+	defer receiver.Close()
+	client := NewAirPlayClient("127.0.0.1", 7000)
+	client.conn = sender
+	client.info = &ReceiverInfo{}
+	client.streamKey = make([]byte, 16)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err := client.setupMirrorSession(ctx, StreamConfig{NetworkHelper: true, NoAudio: true}, nil, false)
+	if err == nil {
+		t.Fatal("setup succeeded without helper")
+	}
+	receiver.SetReadDeadline(time.Now().Add(20 * time.Millisecond))
+	var b [1]byte
+	if n, _ := receiver.Read(b[:]); n != 0 {
+		t.Fatal("sent protocol data before firewall authorization")
+	}
+}

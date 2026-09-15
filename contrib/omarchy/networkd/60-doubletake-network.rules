@@ -1,0 +1,5 @@
+polkit.addRule(function(action, subject) {
+    if (action.id === "org.doubletake.network.configure" && subject.local && subject.active) {
+        return polkit.Result.YES;
+    }
+});

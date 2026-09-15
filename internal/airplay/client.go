@@ -1198,6 +1198,7 @@ func (c *AirPlayClient) readDecryptedBytes(n int) ([]byte, error) {
 
 // StreamConfig holds the configuration for a mirroring session.
 type StreamConfig struct {
+	NetworkHelper          bool // Require temporary firewall authorization before SETUP.
 	FPS                    int
 	Bitrate                int           // Video bitrate in kbps
 	VideoCodec             VideoCodec    // empty/h264, auto, or capability-gated hevc

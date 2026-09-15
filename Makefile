@@ -3,7 +3,7 @@
 PREFIX ?= /usr/local
 MANDIR ?= $(PREFIX)/share/man
 
-all: doubletake doubletake-ctl doubletake-test-receiver
+all: doubletake doubletake-ctl doubletake-test-receiver doubletake-networkd
 
 build: all
 
@@ -53,3 +53,10 @@ uninstall:
 clean:
 	rm -rf bin/
 	go clean -testcache
+
+.PHONY: doubletake-networkd install-omarchy-networkd
+doubletake-networkd:
+	go build -o bin/doubletake-networkd ./cmd/doubletake-networkd
+
+install-omarchy-networkd: doubletake-networkd
+	python3 contrib/omarchy/networkd/install.py

@@ -20,6 +20,8 @@ import (
 	"sync"
 	"time"
 
+	"doubletake/internal/networkhelper"
+
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/hkdf"
 	"howett.net/plist"
@@ -202,20 +204,21 @@ func addTimestampDuration(timestamp uint64, delta time.Duration) (uint64, bool) 
 
 // MirrorSession manages an active screen mirroring session.
 type MirrorSession struct {
-	client      *AirPlayClient
-	dataConn    net.Conn
-	dataMu      sync.Mutex // protects writes to dataConn
-	eventConn   net.Conn
-	timingConn  net.PacketConn
-	cancel      context.CancelFunc
-	closeOnce   sync.Once
-	workers     sync.WaitGroup
-	closeErr    error
-	DataPort    int
-	videoWidth  int
-	videoHeight int
-	videoCodec  VideoCodec
-	sessionURI  string // RTSP session URI for TEARDOWN
+	networkLease *networkhelper.Session
+	client       *AirPlayClient
+	dataConn     net.Conn
+	dataMu       sync.Mutex // protects writes to dataConn
+	eventConn    net.Conn
+	timingConn   net.PacketConn
+	cancel       context.CancelFunc
+	closeOnce    sync.Once
+	workers      sync.WaitGroup
+	closeErr     error
+	DataPort     int
+	videoWidth   int
+	videoHeight  int
+	videoCodec   VideoCodec
+	sessionURI   string // RTSP session URI for TEARDOWN
 
 	streamCipher       func([]byte) []byte // AES-CTR encryption
 	chachaCipher       cipher.AEAD         // ChaCha20-Poly1305 AEAD (nil = use AES-CTR)
@@ -437,11 +440,13 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 	sessionCtx, cancelSession := context.WithCancel(ctx)
 	var receiverEventConn, dataConn net.Conn
 	setupSucceeded := false
+	var networkLease *networkhelper.Session
 	defer func() {
 		if setupSucceeded {
 			return
 		}
 		cancelSession()
+		networkLease.Close()
 		if dataConn != nil {
 			dataConn.Close()
 		}
@@ -452,6 +457,17 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 			conn.Close()
 		}
 	}()
+	if cfg.NetworkHelper {
+		networkLease, err = networkhelper.Begin(sessionCtx, c.conn, audioPorts)
+		if err != nil {
+			return nil, err
+		}
+		go networkLease.Watch(sessionCtx, func() {
+			log.Printf("network helper session ended; closing AirPlay connection")
+			cancelSession()
+			c.conn.Close()
+		})
+	}
 	timingPort := timingConn.LocalAddr().(*net.UDPAddr).Port
 	setupRequest.timingPort = timingPort
 	dbg("[SETUP] consecutive UDP ports: base=%d ctrl=%d data=%d", timingPort, timingPort+1, timingPort+2)
@@ -984,6 +1000,7 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 	}
 
 	session := &MirrorSession{
+		networkLease:   networkLease,
 		client:         c,
 		dataConn:       dataConn,
 		eventConn:      receiverEventConn,
@@ -999,6 +1016,15 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 		mediaClock:     clock,
 	}
 
+	if networkLease != nil {
+		go func() {
+			<-sessionCtx.Done()
+			dataConn.Close()
+			if receiverEventConn != nil {
+				receiverEventConn.Close()
+			}
+		}()
+	}
 	// Set up the video cipher. Encrypted pair-verify uses ChaCha20-Poly1305 with
 	// an HKDF-derived key; plaintext pair-verify uses AES-CTR.
 	if encKey != nil && c.encrypted && ((c.PairKeys != nil && len(c.PairKeys.SharedSecret) > 0) || c.fpAesKey != nil) {
@@ -2085,6 +2111,7 @@ func (s *MirrorSession) Close() error {
 			s.cancel()
 		}
 		s.workers.Wait()
+		s.networkLease.Close()
 
 		// Send TEARDOWN to cleanly end the RTSP session on the receiver.
 		if s.sessionURI != "" && s.client != nil {

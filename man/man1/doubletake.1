@@ -51,6 +51,12 @@ mode. In the Plasma applet, an on-screen PIN uses a visible four-digit field and
 a configured receiver password uses an unrestricted masked field. Doubletake
 does not request an on-screen PIN in password mode.
 .TP
+.B \-network-helper=false
+Disable automatic session firewall permissions (enabled by default).
+Managed mode requires the separately installed doubletake-networkd helper,
+currently supporting IPv4 and UFW on Omarchy. Manual mode requires appropriate
+host firewall configuration and is also used for loopback test receivers.
+.TP
 .B \-port-range \fIMIN-MAX\fR
 Confine local timing and audio UDP sockets to a range of at least three ports,
 including streams started in daemon mode. Reserve three available ports per

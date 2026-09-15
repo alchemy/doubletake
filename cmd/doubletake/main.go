@@ -73,6 +73,7 @@ func main() {
 	noEncrypt := flag.Bool("no-encrypt", false, "Disable RTSP header encryption (debugging only; video frames are always encrypted)")
 	directKey := flag.Bool("direct-key", false, "Use shk/shiv directly without SHA-512 derivation")
 	noAudio := flag.Bool("no-audio", false, "Disable audio streaming")
+	networkHelper := flag.Bool("network-helper", true, "Use the installed privileged firewall helper; false requires manually configured networking")
 	portRange := flag.String("port-range", "", "Local UDP port range for receiver timing/audio (e.g. \"60000-60010\"); empty = OS ephemeral. Needs at least 3 ports.")
 	debug := flag.Bool("debug", false, "Enable verbose debug logging")
 	daemonize := flag.Bool("daemonize", false, "Run as background daemon with Unix socket control interface")
@@ -104,22 +105,23 @@ func main() {
 
 	if *daemonize {
 		runDaemon(daemon.Config{
-			SocketPath:  *socketPath,
-			CredFile:    *credFile,
-			CredBackend: *credBackend,
-			FPS:         *fps,
-			Bitrate:     *bitrate,
-			PortMin:     portMin,
-			PortMax:     portMax,
-			HWAccel:     *hwaccel,
-			VideoCodec:  airplay.VideoCodec(*videoCodec),
-			Debug:       *debug,
-			TestMode:    *testMode,
-			NoEncrypt:   *noEncrypt,
-			DirectKey:   *directKey,
-			NoAudio:     *noAudio,
-			ShowCursor:  !*noCursor,
-			Code:        credential,
+			SocketPath:    *socketPath,
+			CredFile:      *credFile,
+			CredBackend:   *credBackend,
+			FPS:           *fps,
+			Bitrate:       *bitrate,
+			NetworkHelper: *networkHelper,
+			PortMin:       portMin,
+			PortMax:       portMax,
+			HWAccel:       *hwaccel,
+			VideoCodec:    airplay.VideoCodec(*videoCodec),
+			Debug:         *debug,
+			TestMode:      *testMode,
+			NoEncrypt:     *noEncrypt,
+			DirectKey:     *directKey,
+			NoAudio:       *noAudio,
+			ShowCursor:    !*noCursor,
+			Code:          credential,
 		})
 		return
 	}
@@ -325,14 +327,15 @@ func main() {
 	}
 
 	streamCfg := airplay.StreamConfig{
-		FPS:        *fps,
-		Bitrate:    *bitrate,
-		VideoCodec: airplay.VideoCodec(*videoCodec),
-		NoEncrypt:  *noEncrypt,
-		DirectKey:  *directKey,
-		NoAudio:    *noAudio,
-		PortMin:    portMin,
-		PortMax:    portMax,
+		FPS:           *fps,
+		Bitrate:       *bitrate,
+		VideoCodec:    airplay.VideoCodec(*videoCodec),
+		NoEncrypt:     *noEncrypt,
+		DirectKey:     *directKey,
+		NoAudio:       *noAudio,
+		NetworkHelper: *networkHelper,
+		PortMin:       portMin,
+		PortMax:       portMax,
 	}
 	// Complete the potentially interactive Wayland portal request before SETUP,
 	// but delay encoder startup until control SETUP returns session-time display

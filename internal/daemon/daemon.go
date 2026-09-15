@@ -86,34 +86,36 @@ type DeviceInfo struct {
 
 // Config holds daemon configuration.
 type Config struct {
-	SocketPath  string
-	CredFile    string
-	CredBackend string
-	FPS         int
-	Bitrate     int
-	PortMin     int // inclusive local UDP port bound; zero with PortMax means ephemeral
-	PortMax     int // inclusive local UDP port bound; zero with PortMin means ephemeral
-	HWAccel     string
-	VideoCodec  airplay.VideoCodec
-	Debug       bool
-	TestMode    bool
-	NoEncrypt   bool
-	DirectKey   bool
-	NoAudio     bool
-	ShowCursor  bool
-	Code        string // default pairing/Digest credential; request Pin overrides it
+	NetworkHelper bool
+	SocketPath    string
+	CredFile      string
+	CredBackend   string
+	FPS           int
+	Bitrate       int
+	PortMin       int // inclusive local UDP port bound; zero with PortMax means ephemeral
+	PortMax       int // inclusive local UDP port bound; zero with PortMin means ephemeral
+	HWAccel       string
+	VideoCodec    airplay.VideoCodec
+	Debug         bool
+	TestMode      bool
+	NoEncrypt     bool
+	DirectKey     bool
+	NoAudio       bool
+	ShowCursor    bool
+	Code          string // default pairing/Digest credential; request Pin overrides it
 }
 
 func (d *Daemon) mirrorStreamConfig() airplay.StreamConfig {
 	return airplay.StreamConfig{
-		FPS:        d.cfg.FPS,
-		Bitrate:    d.cfg.Bitrate,
-		VideoCodec: d.cfg.VideoCodec,
-		NoEncrypt:  d.cfg.NoEncrypt,
-		DirectKey:  d.cfg.DirectKey,
-		NoAudio:    d.cfg.NoAudio,
-		PortMin:    d.cfg.PortMin,
-		PortMax:    d.cfg.PortMax,
+		NetworkHelper: d.cfg.NetworkHelper,
+		FPS:           d.cfg.FPS,
+		Bitrate:       d.cfg.Bitrate,
+		VideoCodec:    d.cfg.VideoCodec,
+		NoEncrypt:     d.cfg.NoEncrypt,
+		DirectKey:     d.cfg.DirectKey,
+		NoAudio:       d.cfg.NoAudio,
+		PortMin:       d.cfg.PortMin,
+		PortMax:       d.cfg.PortMax,
 	}
 }
 

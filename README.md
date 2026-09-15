@@ -81,11 +81,12 @@ These are devices that have been tested with doubletake. If there are devices no
 make
 ```
 
-This builds the three binaries into `bin/`:
+This builds four binaries into `bin/`:
 
 - `bin/doubletake`
 - `bin/doubletake-ctl`
 - `bin/doubletake-test-receiver`
+- `bin/doubletake-networkd`
 
 ## Install
 
@@ -133,6 +134,22 @@ and video when the advertised audio format is unavailable.
 
 ## Firewall
 
+The CLI now uses `doubletake-networkd` by default to authorize temporary
+receiver-specific UDP ports before session setup. On Omarchy with UFW, install
+it once after building:
+
+```sh
+sudo python3 contrib/omarchy/networkd/install.py
+```
+
+See [Omarchy network helper](contrib/omarchy/networkd/README.md) for requirements,
+installation, cleanup behavior and tests. Ordinary `make install` installs the
+application; the privileged integration is installed separately. The initial
+managed backend supports IPv4 and UFW. Use `-network-helper=false` for manual
+networking, other firewalls, IPv6, or loopback test receivers.
+
+The following manual firewall guidance applies when the helper is disabled.
+
 doubletake reserves three consecutive UDP ports for timing and audio traffic.
 Receiver-initiated NTP sessions probe the timing port during SETUP; PTP and
 sender-initiated NTP sessions do not require that inbound timing traffic. The
@@ -151,7 +168,7 @@ the UDP ports to a small window you can open in your firewall (needs at least 3
 ports):
 
 ```sh
-doubletake -target 192.168.1.77 -port-range 60000-60010
+doubletake -network-helper=false -target 192.168.1.77 -port-range 60000-60010
 ```
 
 Daemon mode uses the same range for every managed stream. Reserve at least
@@ -160,7 +177,7 @@ three available ports per receiver that may stream simultaneously.
 Then with UFW:
 
 ```sh
-sudo ufw allow from any proto udp to any port 60000:60010
+sudo ufw allow from 192.168.1.77 proto udp to any port 60000:60010
 ```
 
 For nftables/firewalld, add an equivalent rule allowing inbound UDP from the
@@ -276,7 +293,7 @@ Then run the real sender against it from another terminal:
 
 ```sh
 DOUBLETAKE_CODE='aaaaaaaa' \
-  bin/doubletake -target 127.0.0.1 -port 7000 -pair -test
+  bin/doubletake -network-helper=false -target 127.0.0.1 -port 7000 -pair -test
 ```
 
 The receiver profiles are coherent validation combinations:
@@ -365,6 +382,7 @@ doubletake-ctl disconnect
 | `-target` | | Apple TV IP (skip mDNS discovery) |
 | `-port` | 7000 | AirPlay port |
 | `-code` | | Pairing PIN shown on the receiver, or its configured password when "Require Password" is enabled (see [Password-protected receivers](#password-protected-receivers)); prefer `$DOUBLETAKE_CODE` |
+| `-network-helper` | true | Use installed Omarchy/UFW helper; `false` selects manual networking |
 | `-port-range` | | Local UDP port range for timing/audio (at least 3 ports) |
 | `-cred-backend` | `file` | Credential backend (`file` or `keyring`) |
 | `-creds` | `~/.config/doubletake/credentials.json` | Credentials file path |
