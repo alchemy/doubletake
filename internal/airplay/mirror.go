@@ -367,8 +367,44 @@ func (c *AirPlayClient) requestSetup(uri, phase string, request map[string]inter
 	return response, headers, receivedAt, nil
 }
 
-// setupMirrorSession negotiates the mirroring stream with the Apple TV.
-func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig, prepareVideoCapture func(width, height int, codec VideoCodec) (VideoPreparationResult, error), captureMayReportMinimumLead bool) (*MirrorSession, error) {
+// missingPTPClockIdentity permits a fresh NTP negotiation only when the receiver
+// omitted the identity or its ClockID. Present invalid values remain errors.
+func missingPTPClockIdentity(response map[string]interface{}) bool {
+	value, present := response["timingPeerInfo"]
+	if !present {
+		return true
+	}
+	peer, valid := value.(map[string]interface{})
+	if !valid {
+		return false
+	}
+	_, present = peer["ClockID"]
+	return !present
+}
+
+var errMissingPTPPeer = errors.New("PTP SETUP response omitted receiver clock identity")
+
+// setupMirrorSession retries once on a fresh authenticated connection. Never
+// change the time domain of a session that has already accepted PTP SETUP.
+func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig, prepare func(int, int, VideoCodec) (VideoPreparationResult, error), calibrated bool) (*MirrorSession, error) {
+	session, firstErr := c.setupMirrorAttempt(ctx, cfg, prepare, calibrated, false)
+	if !errors.Is(firstErr, errMissingPTPPeer) || ctx.Err() != nil {
+		return session, firstErr
+	}
+	log.Printf("[SETUP] receiver omitted PTP clock identity; retrying once with NTP on a fresh connection")
+	if err := c.reconnectForTimingRetry(ctx); err != nil {
+		return nil, fmt.Errorf("%w; NTP reconnect failed: %w", firstErr, err)
+	}
+	session, err := c.setupMirrorAttempt(ctx, cfg, prepare, calibrated, true)
+	if err != nil {
+		_ = c.Close()
+		return nil, fmt.Errorf("%w; NTP retry failed: %w", firstErr, err)
+	}
+	return session, nil
+}
+
+// setupMirrorAttempt negotiates one complete session with one timing protocol.
+func (c *AirPlayClient) setupMirrorAttempt(ctx context.Context, cfg StreamConfig, prepareVideoCapture func(width, height int, codec VideoCodec) (VideoPreparationResult, error), captureMayReportMinimumLead, forceNTP bool) (*MirrorSession, error) {
 	if err := ValidateVideoCodec(string(cfg.VideoCodec)); err != nil {
 		return nil, err
 	}
@@ -378,6 +414,9 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 	policy, err := compatibilityForReceiver(c.info, c.encrypted, !cfg.NoAudio)
 	if err != nil {
 		return nil, fmt.Errorf("negotiate screen audio: %w", err)
+	}
+	if forceNTP {
+		policy.timing = timingProtocolNTP
 	}
 	sourceVersion := policy.sourceVersion()
 	timingProtocol := policy.timing
@@ -612,6 +651,12 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 		if timingProtocol != timingProtocolPTP {
 			return nil
 		}
+		if missingPTPClockIdentity(response) {
+			// SETUP may have allocated receiver resources even though no usable
+			// clock was returned. Teardown is best effort; reconnect is mandatory.
+			_, _, _ = c.rtspRequest("TEARDOWN", audioURI, "", nil, nil)
+			return errMissingPTPPeer
+		}
 		if err := clock.configureFromSetup(response, headers, receivedAt); err != nil {
 			if policy.permitsLocalPTPClock() {
 				if fallbackErr := clock.configureFromLocalClock(); fallbackErr == nil {
@@ -700,6 +745,9 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 		sessionFirstSetup = false
 		dbg("[SETUP] receiver rejected control-first SETUP; negotiating legacy media-first SETUP")
 	} else {
+		if err := configurePTPClock(controlResp, controlHeaders, receivedAt); err != nil {
+			return nil, err
+		}
 		resolvedInfo := c.info
 		sessionDisplayResolved := false
 		if update, ok := controlResp["info"].(map[string]interface{}); ok {
@@ -731,9 +779,6 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 		}
 		startReceiverTimingProbes(controlResp)
 		skipRecord, _ = controlResp["skipRecord"].(bool)
-		if err := configurePTPClock(controlResp, controlHeaders, receivedAt); err != nil {
-			return nil, err
-		}
 		observeEventPort(controlResp)
 		if err := connectEvent(); err != nil {
 			return nil, err
@@ -822,6 +867,11 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 		return nil, err
 	}
 	audioSetupCommitted = true
+	if !sessionFirstSetup {
+		if err := configurePTPClock(audioResp, audioRespHeaders, audioRespReceivedAt); err != nil {
+			return nil, err
+		}
+	}
 	startReceiverTimingProbes(audioResp)
 	observeEventPort(audioResp)
 	if err := connectEvent(); err != nil {
@@ -829,9 +879,6 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 	}
 	if !sessionFirstSetup {
 		skipRecord, _ = audioResp["skipRecord"].(bool)
-		if err := configurePTPClock(audioResp, audioRespHeaders, audioRespReceivedAt); err != nil {
-			return nil, err
-		}
 		resolvedInfo := c.info
 		// A media-first receiver creates its session with the accepted audio
 		// SETUP, so this is the earliest point where its dynamic display metadata

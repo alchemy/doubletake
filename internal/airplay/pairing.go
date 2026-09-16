@@ -215,6 +215,7 @@ var (
 
 // pairTransient performs transient pairing (no PIN required).
 func (c *AirPlayClient) pairTransient(ctx context.Context) error {
+	c.transientPairing = true
 	if c.info != nil && c.info.RequiredPairingCredential() == PairingCredentialPIN {
 		return ErrPINRequired
 	}
@@ -384,6 +385,7 @@ func (c *AirPlayClient) StartPINDisplay() error {
 
 // pairWithPIN performs PIN-based pairing.
 func (c *AirPlayClient) pairWithPIN(ctx context.Context, pin string) error {
+	c.transientPairing = false
 	c.pairingProtocol = pairingProtocolUnknown
 	c.pairType = c.pinPairingType()
 
