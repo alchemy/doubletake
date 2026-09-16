@@ -60,6 +60,20 @@ clock-wait stall that can freeze video while audio continues. Older plugins
 retain their legacy behavior and produce an upgrade hint if the control is
 unavailable.
 
+### Receiver timing compatibility
+
+When a receiver selected for PTP omits `timingPeerInfo` or its `ClockID`,
+doubletake tears down the partial session and retries once with NTP on a fresh
+connection. It repeats authentication and FairPlay negotiation before creating
+new media streams. Present but invalid clock identities still fail; a valid
+identity without private clock headers retains the existing PTP fallback.
+
+Validated on LG OLED55B9PLA, sourceVersion `377.25.06`, firmware `05.50.00`:
+forced NTP produced a responsive desktop, and automatic PTP-to-NTP recovery
+completed SETUP and streamed over 5,000 frames with user-confirmed responsive
+video. TV audio remains unresolved: audio packets were sent, but the user heard
+no TV audio in either run, including a brief tone test.
+
 ## Tested Devices
 
 These are devices that have been tested with doubletake. If there are devices not listed here that you have confirmed working or non-functional, please open an issue.
@@ -285,7 +299,8 @@ The receiver profiles are coherent validation combinations:
 |---------|-------------------------------------------|
 | `modern` | Omits pre-session display metadata and returns a 1920x1080 nominal canvas with a 3840x2160 ceiling through combined control SETUP info; also exercises CoreUtils HAP, encrypted control, features 41/59, PTP, `streamConnections`, ALAC, and descriptor-only FairPlay keys |
 | `roku` | Rejects the initial control SETUP and exercises the one media-first fallback; third-party/HKP pairing, the `377.40.x` NTP exception, ALAC, and one alternate audio-descriptor retry under authenticated HAP |
-| `lg` | Rejects the initial control SETUP and exercises the one media-first fallback; third-party/HKP HAP, feature-41 PTP with a local clock anchor, feature-59-absent `controlPort` + `shk`, and ALAC |
+| `lg` | Models OLED55B9PLA (`377.25.06`): accepts control SETUP but omits PTP ClockID despite feature 41; retries on a fresh authenticated NTP session, with receiver-initiated timing, `controlPort` + `shk`, and ALAC |
+| `legacy-ptp` | Synthetic legacy HAP receiver: media-first SETUP, valid PTP identity without private timestamp headers (local clock anchor), `controlPort` + `shk`, and ALAC |
 | `appletv3` | Rejects the initial control SETUP and exercises the one media-first fallback; raw pairing with feature 27, receiver-initiated NTP, original raw FairPlay derivation, ALAC, and plaintext root FairPlay keys |
 | `uxplay` | Rejects the initial control SETUP and exercises the one media-first fallback; raw pairing without feature 27, `X-Apple-PD` FairPlay-secret mixing, NTP, ALAC, plaintext FairPlay roots, and omitted optional `eventPort` |
 | `airserver` (`airtame` alias) | Accepts the initial control SETUP; a rejected HAP probe followed by raw fallback, plaintext NTP, feature-59 `streamConnections` followed by one accepted `controlPort` retry, advertised AAC-ELD, and plaintext root FairPlay keys |

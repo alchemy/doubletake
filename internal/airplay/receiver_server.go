@@ -33,6 +33,7 @@ const (
 	ReceiverProfileModern    ReceiverProfile = "modern"
 	ReceiverProfileRoku      ReceiverProfile = "roku"
 	ReceiverProfileLG        ReceiverProfile = "lg"
+	ReceiverProfileLegacyPTP ReceiverProfile = "legacy-ptp"
 	ReceiverProfileAppleTV3  ReceiverProfile = "appletv3"
 	ReceiverProfileUxPlay    ReceiverProfile = "uxplay"
 	ReceiverProfileAirServer ReceiverProfile = "airserver"
@@ -137,6 +138,7 @@ type receiverProfileSpec struct {
 	ntpInitiator             receiverNTPInitiator
 	advertisePTPInfo         bool
 	providePTPClockIdentity  bool
+	acceptPTPWithoutIdentity bool
 	providePTPClockHeaders   bool
 	audioConnectionsWithHAP  bool
 	audioResponseConnections bool
@@ -355,23 +357,33 @@ func receiverProfile(profile ReceiverProfile) (receiverProfileSpec, error) {
 			displayWidth:             1920,
 			displayHeight:            1080,
 		}, nil
+	case ReceiverProfileLegacyPTP:
+		profile, err := receiverProfile(ReceiverProfileLG)
+		profile.name = "doubletake synthetic legacy PTP receiver"
+		profile.setupOrder = receiverSetupMediaFirst
+		profile.timingProtocol = timingProtocolPTP
+		profile.ntpInitiator = receiverNTPNone
+		profile.providePTPClockIdentity = true
+		profile.acceptPTPWithoutIdentity = false
+		return profile, err
 	case ReceiverProfileLG:
 		return receiverProfileSpec{
-			name:                    "doubletake LG test receiver",
-			manufacturer:            "LG Electronics",
-			model:                   "75UP75009LC",
-			sourceVersion:           "377.25.06",
-			features:                uint64(0x038bcb46007f8ad0),
-			pairing:                 receiverPairingLegacyHAP,
-			setupOrder:              receiverSetupMediaFirst,
-			timingProtocol:          timingProtocolPTP,
-			advertisePTPInfo:        true,
-			providePTPClockIdentity: true,
-			audioCodec:              AudioCodecALAC,
-			supportedScreenFormats:  0x40000,
-			audioSHKWithHAP:         true,
-			displayWidth:            1920,
-			displayHeight:           1080,
+			name:                     "doubletake LG test receiver",
+			manufacturer:             "LG Electronics",
+			model:                    "OLED55B9PLA",
+			sourceVersion:            "377.25.06",
+			features:                 uint64(0x038bcb46007f8ad0),
+			pairing:                  receiverPairingLegacyHAP,
+			setupOrder:               receiverSetupSessionFirst,
+			timingProtocol:           timingProtocolNTP,
+			ntpInitiator:             receiverNTPReceiver,
+			advertisePTPInfo:         true,
+			acceptPTPWithoutIdentity: true,
+			audioCodec:               AudioCodecALAC,
+			supportedScreenFormats:   0x40000,
+			audioSHKWithHAP:          true,
+			displayWidth:             1920,
+			displayHeight:            1080,
 		}, nil
 	case ReceiverProfileAppleTV3:
 		return receiverProfileSpec{
@@ -532,15 +544,16 @@ func (s *ReceiverServer) logf(format string, args ...any) {
 }
 
 type receiverConnection struct {
-	server       *ReceiverServer
-	conn         net.Conn
-	reader       *bufio.Reader
-	pairing      *receiverPairingState
-	fairplay     *receiverFPSAPState
-	hap          *receiverHAPStream
-	media        *receiverMediaSession
-	timingProbed bool
-	sessionState receiverSessionState
+	server           *ReceiverServer
+	conn             net.Conn
+	reader           *bufio.Reader
+	pairing          *receiverPairingState
+	fairplay         *receiverFPSAPState
+	hap              *receiverHAPStream
+	media            *receiverMediaSession
+	timingProbed     bool
+	senderTimingPort int
+	sessionState     receiverSessionState
 }
 
 type receiverSessionState uint8
@@ -963,6 +976,9 @@ func (c *receiverConnection) handleSetup(request receiverRequest) receiverRespon
 	if err := c.validateSetup(setup, streams, kind); err != nil {
 		return receiverError(400, err)
 	}
+	if port := plistInt(setup["timingPort"]); port > 0 {
+		c.senderTimingPort = port
+	}
 	if err := c.ensureMedia(); err != nil {
 		return receiverError(500, err)
 	}
@@ -976,6 +992,13 @@ func (c *receiverConnection) handleSetup(request receiverRequest) receiverRespon
 	if kind == receiverSetupControl {
 		if combined, _ := setup["combinedGetInfoWithControlSetup"].(bool); combined && !c.server.cfg.OmitCombinedInfo {
 			response["info"] = c.server.info(true)
+		}
+	}
+	if c.server.profile.acceptPTPWithoutIdentity && setup["timingProtocol"] == timingProtocolPTP {
+		response["timingPeerInfo"] = map[string]any{
+			"ID":                                c.server.identifier,
+			"Addresses":                         []any{controlLocalIP(c.conn)},
+			"SupportsClockPortMatchingOverride": false,
 		}
 	}
 	if c.server.profile.timingProtocol == timingProtocolPTP && c.server.profile.providePTPClockIdentity {
@@ -1003,7 +1026,7 @@ func (c *receiverConnection) handleSetup(request receiverRequest) receiverRespon
 		switch plistInt(stream["type"]) {
 		case 96:
 			if c.server.profile.timingProtocol == timingProtocolNTP &&
-				c.server.profile.ntpInitiator == receiverNTPReceiver && !c.timingProbed {
+				c.server.profile.ntpInitiator == receiverNTPReceiver && !c.timingProbed && c.senderTimingPort > 0 {
 				c.probeLegacyTiming(setup)
 			}
 			audio := map[string]any{
@@ -1070,10 +1093,10 @@ func (c *receiverConnection) validateSetup(setup map[string]any, streams []map[s
 
 	if hasSession {
 		protocol, _ := setup["timingProtocol"].(string)
-		if protocol != profile.timingProtocol {
+		if protocol != profile.timingProtocol && !(profile.acceptPTPWithoutIdentity && protocol == timingProtocolPTP) {
 			return fmt.Errorf("timingProtocol is %q, want %q", protocol, profile.timingProtocol)
 		}
-		switch profile.timingProtocol {
+		switch protocol {
 		case timingProtocolNTP:
 			if plistInt(setup["timingPort"]) <= 0 {
 				return fmt.Errorf("NTP SETUP omitted timingPort")
@@ -1339,7 +1362,7 @@ func controlLocalIP(conn net.Conn) string {
 
 func (c *receiverConnection) probeLegacyTiming(setup map[string]any) {
 	c.timingProbed = true
-	port := plistInt(setup["timingPort"])
+	port := c.senderTimingPort
 	remote, ok := c.conn.RemoteAddr().(*net.TCPAddr)
 	if port <= 0 || !ok {
 		c.server.logf("legacy SETUP omitted a usable sender timing port")
@@ -1354,6 +1377,7 @@ func (c *receiverConnection) probeLegacyTiming(setup map[string]any) {
 
 func (c *receiverConnection) closeMedia() {
 	c.timingProbed = false
+	c.senderTimingPort = 0
 	if c.media == nil {
 		return
 	}

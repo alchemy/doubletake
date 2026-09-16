@@ -29,7 +29,8 @@ func TestReceiverServerEndToEndProfiles(t *testing.T) {
 	}{
 		{name: "modern Apple HAP accepts control-first PTP", profile: ReceiverProfileModern, wantEncrypted: true, wantSetups: 3, wantFairPlay: 2, wantEvents: 1},
 		{name: "Roku raw negotiates media-first receiver-initiated NTP", profile: ReceiverProfileRoku, wantSetups: 3, wantTiming: 3, wantEvents: 1},
-		{name: "LG HAP negotiates media-first PTP", profile: ReceiverProfileLG, wantEncrypted: true, wantSetups: 3, wantEvents: 1},
+		{name: "legacy HAP negotiates media-first PTP", profile: ReceiverProfileLegacyPTP, wantEncrypted: true, wantSetups: 3, wantEvents: 1},
+		{name: "LG retries missing PTP identity with NTP", profile: ReceiverProfileLG, wantEncrypted: true, wantSetups: 4, wantTiming: 3, wantEvents: 1},
 		{name: "AppleTV3 raw negotiates media-first receiver-initiated NTP", profile: ReceiverProfileAppleTV3, wantSetups: 3, wantFairPlay: 2, wantTiming: 3, wantEvents: 1},
 		{name: "UxPlay legacy negotiates media-first without eventPort", profile: ReceiverProfileUxPlay, wantSetups: 3, wantFairPlay: 2, wantTiming: 3},
 		{name: "AirServer raw control-first with descriptor retry", profile: ReceiverProfileAirServer, wantSetups: 4, wantFairPlay: 2, wantTiming: 3, wantEvents: 1},
@@ -86,7 +87,11 @@ func TestReceiverServerEndToEndProfiles(t *testing.T) {
 			if stats.SetupRequests != test.wantSetups {
 				t.Fatalf("SETUP requests = %d, want %d", stats.SetupRequests, test.wantSetups)
 			}
-			if stats.RecordRequests != 1 || stats.FeedbackRequests < 1 || stats.TeardownRequests != 1 {
+			wantTeardowns := uint64(1)
+			if test.profile == ReceiverProfileLG {
+				wantTeardowns = 2
+			}
+			if stats.RecordRequests != 1 || stats.FeedbackRequests < 1 || stats.TeardownRequests != wantTeardowns {
 				t.Fatalf("control stats = %+v", stats)
 			}
 			if stats.FairPlayRequests != test.wantFairPlay {
@@ -181,8 +186,8 @@ func TestReceiverProfilePresets(t *testing.T) {
 		{ReceiverProfileRoku, "3820R2", "377.40.00", 0x038bcf46007f8ad0, receiverPairingLegacy,
 			receiverSetupMediaFirst, timingProtocolNTP, receiverNTPReceiver, true, false, false, true, true,
 			AudioCodecALAC, 0x40000, true, false, receiverLegacyVideoNone, false, 1920, 1080, 0, 0, false},
-		{ReceiverProfileLG, "75UP75009LC", "377.25.06", 0x038bcb46007f8ad0, receiverPairingLegacyHAP,
-			receiverSetupMediaFirst, timingProtocolPTP, receiverNTPNone, true, true, false, false, false,
+		{ReceiverProfileLG, "OLED55B9PLA", "377.25.06", 0x038bcb46007f8ad0, receiverPairingLegacyHAP,
+			receiverSetupSessionFirst, timingProtocolNTP, receiverNTPReceiver, true, false, false, false, false,
 			AudioCodecALAC, 0x40000, true, false, receiverLegacyVideoNone, false, 1920, 1080, 0, 0, false},
 		{ReceiverProfileAppleTV3, "AppleTV3,2", "220.68", 0x1e5a7ffff7, receiverPairingLegacy,
 			receiverSetupMediaFirst, timingProtocolNTP, receiverNTPReceiver, false, false, false, false, false,
@@ -1006,13 +1011,16 @@ func TestReceiverServerConfigValidation(t *testing.T) {
 	}
 }
 
-func newReceiverServerTestPair(t *testing.T, cfg ReceiverConfig) (*ReceiverServer, *AirPlayClient, context.Context) {
+func newReceiverServerTestPair(t *testing.T, cfg ReceiverConfig, configure ...func(*ReceiverServer)) (*ReceiverServer, *AirPlayClient, context.Context) {
 	t.Helper()
 	cfg.ListenAddress = "127.0.0.1:0"
 	cfg.Logger = log.New(io.Discard, "", 0)
 	server, err := NewReceiverServer(cfg)
 	if err != nil {
 		t.Fatalf("new receiver server: %v", err)
+	}
+	for _, apply := range configure {
+		apply(server)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	done := make(chan error, 1)

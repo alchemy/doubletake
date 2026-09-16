@@ -281,7 +281,8 @@ type AirPlayClient struct {
 	// connection. It starts unset because feature flags choose only which
 	// protocol to probe first; a receiver may advertise HAP while implementing
 	// only the original raw AirPlay exchange.
-	pairingProtocol pairingProtocol
+	pairingProtocol  pairingProtocol
+	transientPairing bool // Identity is scoped to the current receiver connection.
 
 	// Encryption state after pair-verify
 	encrypted     bool

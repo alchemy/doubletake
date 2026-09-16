@@ -83,6 +83,7 @@ func (c *AirPlayClient) RestorePairingCredentials(saved *SavedCredentials) error
 	}
 
 	pub, priv := saved.Ed25519Keys()
+	c.transientPairing = false
 	c.PairingID = saved.PairingID
 	c.PairKeys = &PairKeys{
 		Ed25519Public:  append(ed25519.PublicKey(nil), pub...),
