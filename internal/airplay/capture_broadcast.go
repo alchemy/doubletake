@@ -3,6 +3,7 @@ package airplay
 import (
 	"errors"
 	"io"
+	"log"
 	"sync"
 	"time"
 )
@@ -18,6 +19,12 @@ const (
 	// pathological source that returns tiny reads from consuming unbounded slice
 	// metadata; it is deliberately generous for normal H.264 buffer cadence.
 	broadcastSinkQueueChunks = 4096
+
+	// Shared readers must tolerate encoder output arriving in short bursts.
+	// The 67ms presentation margin only holds two frames at 30fps; a healthy
+	// VA-API encoder can deliver three before the reader is scheduled. This is
+	// a queue ceiling, not added playback delay. Slow peers remain bounded.
+	broadcastSinkFrameQueueDuration = 250 * time.Millisecond
 
 	// Source shutdown normally races with consumers draining their last few
 	// buffers. Do not let a receiver that stopped reading keep Run alive forever.
@@ -105,7 +112,7 @@ func newBroadcastSinkWithPolicy(owner *BroadcastCapture, backpressure bool) *Bro
 		owner:                 owner,
 		maxQueuedBytes:        broadcastSinkQueueBytes,
 		maxQueuedChunks:       broadcastSinkQueueChunks,
-		maxFrameQueueDuration: ordinaryScreenFrameQueueDuration,
+		maxFrameQueueDuration: broadcastSinkFrameQueueDuration,
 		backpressure:          backpressure,
 		frameDuration:         frameDuration,
 		done:                  make(chan struct{}),
@@ -276,6 +283,7 @@ func (bc *BroadcastCapture) runFrames() error {
 
 			for _, sink := range sinks {
 				if err := sink.enqueueFrame(frame); err != nil {
+					log.Printf("[BROADCAST] detaching receiver: %v", err)
 					bc.RemoveSink(sink)
 				}
 			}

@@ -418,7 +418,9 @@ so connection order does not determine another receiver's size. For example, a
 receiver reporting a 1920x1080 canvas and a 3840x2160 maximum joins the
 3840x2160 HEVC group when automatic HEVC is available, or the 1920x1080 H.264
 group when it is unavailable or H.264 is forced.
-Fan-out uses a bounded queue per target within each group. A
+Fan-out uses a bounded queue per target within each group. Timestamped video
+permits up to 250 ms of nominal frame duration to absorb short encoder bursts;
+this is a capacity limit, not an added playback delay. A
 stalled target is detached when its queue fills, without blocking peers that
 share the encoder. Other canvas groups continue independently as well.
 

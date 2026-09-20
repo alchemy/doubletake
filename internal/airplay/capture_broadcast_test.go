@@ -189,6 +189,7 @@ func TestBroadcastSinkCloseUnblocksBackpressuredFrame(t *testing.T) {
 
 func TestBroadcastSinkNonblockingFrameQueueUsesNominalDuration(t *testing.T) {
 	sink := newBroadcastSink(nil)
+	sink.maxFrameQueueDuration = 67 * time.Millisecond
 	base := time.Now()
 	// A large or backward PTS gap can be caused by the upstream leaky queue; it
 	// must not turn one queued picture into an artificial duration overflow.
@@ -210,8 +211,8 @@ func TestBroadcastSinkNominalDurationUsesConfiguredFrameRate(t *testing.T) {
 		acceptedFrames  int
 		rejectedOrdinal int
 	}{
-		{fps: 20, acceptedFrames: 1, rejectedOrdinal: 2},
-		{fps: 60, acceptedFrames: 4, rejectedOrdinal: 5},
+		{fps: 20, acceptedFrames: 5, rejectedOrdinal: 6},
+		{fps: 60, acceptedFrames: 15, rejectedOrdinal: 16},
 	} {
 		t.Run(fmt.Sprintf("%dfps", test.fps), func(t *testing.T) {
 			broadcast := NewBroadcastCaptureWithFrameRate(nil, test.fps)
@@ -363,7 +364,7 @@ func TestBackpressuredByteBroadcastHandoff(t *testing.T) {
 
 func TestLoneSharedTimestampedSinkDoesNotBackpressureCapture(t *testing.T) {
 	base := time.Now()
-	frames := make([]VideoAccessUnit, 4)
+	frames := make([]VideoAccessUnit, 12)
 	for i := range frames {
 		frames[i] = VideoAccessUnit{
 			AnnexB: []byte{byte(i + 1)},
@@ -424,7 +425,7 @@ func TestTimestampedSlowSinkDoesNotStallHealthyPeer(t *testing.T) {
 	}()
 
 	base := time.Now()
-	for i := 0; i < 6; i++ {
+	for i := 0; i < 12; i++ {
 		want := VideoAccessUnit{
 			AnnexB: []byte{byte(i + 1)},
 			PTS:    base.Add(time.Duration(i) * time.Second / 30),
@@ -840,5 +841,36 @@ func TestBroadcastCaptureClosesSinkAddedAfterSourceStops(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("sink added after capture stop remained open")
+	}
+}
+
+// The VA-API pipeline can hand off three frames together near a keyframe.
+// Daemon consumers must survive that scheduling burst without dropping any
+// encoded references, while stalled consumers must still be evicted.
+func TestSharedSinkToleratesEncoderBurstButBoundsStalledReceiver(t *testing.T) {
+	broadcast := NewBroadcastCaptureWithFrameRate(nil, 30)
+	healthy, stalled := broadcast.AddSink(), broadcast.AddSink()
+	defer healthy.Close()
+	defer stalled.Close()
+	for burst := 0; burst < 3; burst++ {
+		for i := 0; i < 3; i++ {
+			frame := VideoAccessUnit{AnnexB: []byte{byte(burst*3 + i + 1)}}
+			if err := healthy.enqueueFrame(frame); err != nil {
+				t.Fatalf("healthy burst rejected: %v", err)
+			}
+			err := stalled.enqueueFrame(frame)
+			if burst*3+i < 7 && err != nil {
+				t.Fatalf("early stalled rejection: %v", err)
+			}
+			if burst*3+i >= 7 && !errors.Is(err, errBroadcastSinkBacklog) {
+				t.Fatalf("stalled sink unbounded: %v", err)
+			}
+		}
+		for i := 0; i < 3; i++ {
+			frame, err := healthy.ReadVideoAccessUnit()
+			if err != nil || len(frame.AnnexB) != 1 || frame.AnnexB[0] != byte(burst*3+i+1) {
+				t.Fatalf("frame dropped/reordered: %v %v", frame, err)
+			}
+		}
 	}
 }
