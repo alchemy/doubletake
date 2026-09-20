@@ -2,6 +2,26 @@
 
 AirPlay screen mirroring sender for Linux. Streams your desktop to an Apple TV using the AirPlay mirroring protocol.
 
+## Maintained fork
+
+This is [alchemy/doubletake](https://github.com/alchemy/doubletake), an
+independently maintained fork of [omarroth/doubletake](https://github.com/omarroth/doubletake).
+Our `main` includes selected fixes beyond upstream; distribution packages listed
+below may still contain only upstream code. See [fork maintenance and validation](FORK.md)
+for included changes, known limitations, and release checks.
+
+To build this fork, install the requirements below, then:
+
+```sh
+git clone https://github.com/alchemy/doubletake.git
+cd doubletake
+make all
+./bin/doubletake
+```
+
+Record `git rev-parse HEAD` when reporting a problem. Check out that exact commit
+before rebuilding to reproduce the same source version.
+
 ## Features
 
 - Full AirPlay mirroring protocol (RTSP/HTTP + encrypted video stream)
