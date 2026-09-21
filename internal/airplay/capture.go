@@ -207,12 +207,37 @@ func PrepareCapture(ctx context.Context, cfg CaptureConfig) (*CapturePreparation
 	if err := exec.Command("gst-inspect-1.0", "pipewiresrc").Run(); err != nil {
 		return nil, fmt.Errorf("GStreamer 'pipewiresrc' plugin not found; install gst-pipewire")
 	}
+	// Hold the acquisition lock through the portal reply, including mirror
+	// requests, so our own processes cannot consume another extend marker.
+	marker := ""
+	if os.Getenv("HYPRLAND_INSTANCE_SIGNATURE") != "" {
+		lock, path, err := lockExtendPicker(ctx)
+		if err != nil {
+			return nil, err
+		}
+		defer lock.Close()
+		marker = path
+		_ = os.Remove(marker) // discard a stale marker left by an interrupted request
+	}
 	if cfg.ExtendSize != "" {
+		if marker == "" {
+			return nil, fmt.Errorf("extend mode requires Hyprland")
+		}
+		if err := ensureExtendPicker(ctx); err != nil {
+			return nil, err
+		}
 		output, err := prepareExtendedOutput(ctx, cfg.ExtendSize, cfg.FPS)
 		if err != nil {
 			return nil, err
 		}
 		preparation.extendedOutput = output
+		request := fmt.Sprintf("%d %d %s\n", os.Getpid(), time.Now().Add(30*time.Second).Unix(), output.name)
+		if err := writePickerFile(marker, []byte(request), 0600); err != nil {
+			preparation.Close()
+			return nil, err
+		}
+		defer os.Remove(marker)
+
 		// A physical-monitor restore token must never silently override extend.
 		cfg.RestoreToken = ""
 		cfg.SaveRestoreToken = nil

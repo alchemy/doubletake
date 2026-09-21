@@ -80,7 +80,7 @@ func main() {
 	x11WindowID := flag.String("x11-window-id", "", "X11 window id to capture, decimal or 0xhex")
 	x11WindowName := flag.String("x11-window-name", "", "X11 window name to capture; prefer -x11-window-id")
 	noCursor := flag.Bool("no-cursor", false, "Don't show the mouse cursor in the captured video")
-	extend := flag.Bool("extend", false, "Extend the desktop using a temporary Hyprland monitor (select it in the sharing picker)")
+	extend := flag.Bool("extend", false, "Extend the desktop using an automatically selected temporary Hyprland monitor")
 	extendSize := flag.String("extend-size", "1920x1080", "Extended desktop size: WIDTHxHEIGHT")
 	flag.Parse()
 	extendCanvas := ""

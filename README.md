@@ -47,11 +47,10 @@ before rebuilding to reproduce the same source version.
 ```
 
 Doubletake creates a temporary monitor named `doubletake-…`, placed automatically
-beside your existing monitors. **Select that monitor in the sharing picker**, then
-move windows onto it using your usual Hyprland workspace/window controls. Choosing
-a physical monitor in the picker will share that monitor instead; the portal does
-not let doubletake force the selection. Saved mirror selections are ignored and
-extend selections do not overwrite your saved mirror token.
+beside your existing monitors and selects it automatically using the Hyprland
+portal picker hook. Move windows onto it using your usual Hyprland workspace/window
+controls. Saved mirror selections are ignored and extend selections do not
+overwrite your saved mirror token.
 
 The default desktop is 1920×1080 at scale 1, with the `-fps` refresh rate. It is
 scaled to the receiver's negotiated video canvas. This uses the existing AirPlay
@@ -69,12 +68,38 @@ Each connected receiver gets an independent desktop. Mode and desktop size are
 chosen when starting the daemon; the existing plugin/controller can connect and
 disconnect receivers, but cannot switch modes in an already-running daemon.
 
+### Hyprland picker integration
+
+On first use, extend mode installs `hyprland-picker.sh` under
+`$XDG_DATA_HOME/doubletake` (default `~/.local/share/doubletake`) and appends a
+marked block to `~/.config/hypr/xdph.conf` (or `$XDG_CONFIG_HOME/hypr/xdph.conf`).
+The existing picker remains the fallback, including custom preview pickers.
+The original configuration is backed up as `xdph.conf.doubletake-backup`.
+
+That first installation restarts `xdg-desktop-portal-hyprland`, which interrupts
+other active screen shares. Subsequent connections leave the portal running.
+The wrapper remains installed after disconnect and uses the normal picker unless
+it consumes a one-shot extend marker. Markers expire after 30 seconds, require a
+live sender, and are removed after the portal request, including failed requests.
+Doubletake serializes its portal acquisitions across processes.
+
+**Limitation:** Hyprland does not supply requester identity to custom pickers.
+Another application's simultaneous share request can consume the extend marker
+and receive the virtual display. Avoid starting other screen shares during extend
+connection startup. Ordinary sharing after startup uses the normal picker.
+Finish any active Waycast session before first installing this integration.
+
+To uninstall the integration, stop sharing, remove only the block between
+`# BEGIN doubletake extend picker` and `# END doubletake extend picker` from
+`xdph.conf`, restart `xdg-desktop-portal-hyprland`, and remove the wrapper script.
+Preserve other edits rather than restoring an old backup over the current file.
+
 Requirements: a running Hyprland session, `hyprctl`, and a working Wayland sharing
 portal/PipeWire setup. Other compositors and X11 extend are not implemented.
 `-extend` cannot be combined with `-test` or X11 window capture.
 
 The monitor is removed on normal disconnect, cancellation, and handled setup errors;
-no desktop configuration files are edited. After a forced kill or process crash,
+the virtual monitor is not saved in your monitor configuration. After a forced kill or process crash,
 a monitor may remain. Identify it with `hyprctl monitors all`, then remove only its
 exact name with `hyprctl output remove doubletake-NAME`.
 

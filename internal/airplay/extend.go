@@ -151,6 +151,6 @@ func createExtendedOutput(ctx context.Context, run hyprCommand, name string, w, 
 		return nil, fmt.Errorf("Hyprland did not apply %s to output %s", mode, name)
 	}
 	success = true
-	log.Printf("[EXTEND] created %s (%s). Select this monitor in the sharing picker, then move windows onto it.", name, mode)
+	log.Printf("[EXTEND] created %s (%s). Selecting this monitor automatically for sharing.", name, mode)
 	return o, nil
 }
