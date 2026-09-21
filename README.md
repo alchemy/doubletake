@@ -440,7 +440,7 @@ doubletake-ctl unmute [target]
 
 - `disconnect` without a target stops all active streams.
 - `disconnect <target>` stops only that receiver.
-- `mute`/`unmute` can operate globally or per target.
+- `mute`/`unmute` can operate globally or per target. They silence/resume outgoing audio without changing the TV volume. Audio already buffered by the receiver may finish playing before mute takes effect.
 - `pin` retains its historical command name, but submits whichever credential
   the daemon requests: an on-screen PIN or a configured password. It is
   targetless and therefore requires exactly one waiting receiver; use

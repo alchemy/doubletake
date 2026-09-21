@@ -344,20 +344,6 @@ func TestModernAudioStreamFields(t *testing.T) {
 	}
 }
 
-func TestAudioVolumeBody(t *testing.T) {
-	for _, test := range []struct {
-		muted bool
-		want  string
-	}{
-		{want: "volume: 0.000000\r\n"},
-		{muted: true, want: "volume: -144.000000\r\n"},
-	} {
-		if got := string(audioVolumeBody(test.muted)); got != test.want {
-			t.Errorf("audioVolumeBody(%t) = %q, want %q", test.muted, got, test.want)
-		}
-	}
-}
-
 func TestSetupMirrorNoAudioStillNegotiatesAudioSession(t *testing.T) {
 	SetTargetLatency(0)
 	t.Cleanup(func() {
@@ -372,12 +358,20 @@ func TestSetupMirrorNoAudioStillNegotiatesAudioSession(t *testing.T) {
 		{name: "skip record", skipRecord: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			testSetupMirrorNoAudioStillNegotiatesAudioSession(t, test.skipRecord)
+			testSetupMirrorPreservesReceiverVolume(t, test.skipRecord, true)
 		})
 	}
 }
 
-func testSetupMirrorNoAudioStillNegotiatesAudioSession(t *testing.T, skipRecord bool) {
+func TestSetupMirrorWithAudioPreservesReceiverVolume(t *testing.T) {
+	for _, skipRecord := range []bool{false, true} {
+		t.Run(fmt.Sprintf("skipRecord=%t", skipRecord), func(t *testing.T) {
+			testSetupMirrorPreservesReceiverVolume(t, skipRecord, false)
+		})
+	}
+}
+
+func testSetupMirrorPreservesReceiverVolume(t *testing.T, skipRecord, noAudio bool) {
 	eventListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen event channel: %v", err)
@@ -610,14 +604,8 @@ func testSetupMirrorNoAudioStillNegotiatesAudioSession(t *testing.T, skipRecord 
 					return
 				}
 			case "SET_PARAMETER":
-				if string(req.body) != "volume: 0.000000\r\n" {
-					serverErr <- fmt.Errorf("unexpected SET_PARAMETER body %q", string(req.body))
-					return
-				}
-				if err := writeRTSPTestResponse(conn, 200, nil, nil); err != nil {
-					serverErr <- err
-					return
-				}
+				serverErr <- fmt.Errorf("setup must preserve receiver volume; got SET_PARAMETER %q", req.body)
+				return
 			case "POST":
 				if req.uri != "/feedback" {
 					serverErr <- fmt.Errorf("unexpected POST URI %s", req.uri)
@@ -652,11 +640,14 @@ func testSetupMirrorNoAudioStillNegotiatesAudioSession(t *testing.T, skipRecord 
 	defer client.Close()
 	// -no-audio is also the escape hatch for receivers that advertise no screen
 	// audio codec we can encode. Timing and video setup must remain usable.
-	client.info = &ReceiverInfo{SupportedFormats: StreamFormats{ScreenStream: 0x800000}}
+	client.info = &ReceiverInfo{}
+	if noAudio {
+		client.info.SupportedFormats = StreamFormats{ScreenStream: 0x800000}
+	}
 
-	session, err := client.SetupMirror(ctx, StreamConfig{FPS: 30, NoAudio: true})
+	session, err := client.SetupMirror(ctx, StreamConfig{FPS: 30, NoAudio: noAudio})
 	if err != nil {
-		t.Fatalf("SetupMirror(no audio): %v", err)
+		t.Fatalf("SetupMirror(noAudio=%t): %v", noAudio, err)
 	}
 	if !session.HasAudio() {
 		t.Fatal("expected no-audio session setup to keep the negotiated audio stream state")
@@ -697,7 +688,7 @@ func testSetupMirrorNoAudioStillNegotiatesAudioSession(t *testing.T, skipRecord 
 		recordIndex = len(wantMethods)
 		wantMethods = append(wantMethods, "RECORD")
 	}
-	wantMethods = append(wantMethods, "SET_PARAMETER", "SET_PARAMETER", "POST", "TEARDOWN")
+	wantMethods = append(wantMethods, "POST", "TEARDOWN")
 	got := make([]rtspTestRequest, 0, len(wantMethods))
 	for range wantMethods {
 		select {

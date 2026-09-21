@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/chacha20poly1305"
@@ -231,6 +232,7 @@ type MirrorSession struct {
 	mediaClock         *mediaClock
 
 	// Audio
+	audioMuted  atomic.Bool
 	audioStream *AudioStream
 	noAudio     bool
 }
@@ -1011,17 +1013,8 @@ func (c *AirPlayClient) setupMirrorAttempt(ctx context.Context, cfg StreamConfig
 		}
 	}
 
-	// Set volume to 0 dB (full scale). Positive dB values are invalid here and
-	// current receivers may interpret them as zero gain.
-	volumeBody := audioVolumeBody(false)
-	_, _, err = c.rtspRequest("SET_PARAMETER", audioURI, "text/parameters", volumeBody, nil)
-	if err != nil {
-		dbg("[SETUP] SET_PARAMETER volume failed (non-fatal): %v", err)
-	} else {
-		dbg("[SETUP] SET_PARAMETER volume=0 sent")
-	}
-	// Send volume twice (pcap shows real senders do this)
-	_, _, _ = c.rtspRequest("SET_PARAMETER", audioURI, "text/parameters", volumeBody, nil)
+	// Preserve the receiver's volume. AirPlay volume 0 dB means maximum
+	// volume and can change the physical TV volume, not just stream gain.
 
 	if timingProtocol == timingProtocolPTP {
 		// PTP uses the receiver's fixed 319/320 ports. The first socket was only
@@ -2232,24 +2225,14 @@ func (s *MirrorSession) HasAudio() bool {
 	return s.audioStream != nil
 }
 
-// SetAudioMuted updates mirrored audio volume on the receiver.
-// AirPlay uses SET_PARAMETER volume where 0 dB is max and -144 dB is muted.
+// SetAudioMuted silences outgoing PCM without changing receiver volume.
+// Already buffered audio may remain audible until its normal playout time.
 func (s *MirrorSession) SetAudioMuted(muted bool) error {
-	if s == nil || s.client == nil || s.sessionURI == "" {
-		return fmt.Errorf("audio control unavailable")
+	if s == nil || s.noAudio || s.audioStream == nil {
+		return fmt.Errorf("audio control unavailable: session has no audio")
 	}
-
-	if _, _, err := s.client.rtspRequest("SET_PARAMETER", s.sessionURI, "text/parameters", audioVolumeBody(muted), nil); err != nil {
-		return fmt.Errorf("set audio muted=%t: %w", muted, err)
-	}
+	s.audioMuted.Store(muted)
 	return nil
-}
-
-func audioVolumeBody(muted bool) []byte {
-	if muted {
-		return []byte("volume: -144.000000\r\n")
-	}
-	return []byte("volume: 0.000000\r\n")
 }
 
 // AudioStream returns the audio stream for this session (may be nil).

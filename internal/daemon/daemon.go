@@ -1708,11 +1708,17 @@ func (d *Daemon) handleSetMute(req Request, muted bool) Response {
 
 	sessions := make([]*airplay.MirrorSession, 0, len(targets))
 	for _, t := range targets {
-		if t.session != nil && (d.cfg.NoAudio || t.session.HasAudio()) {
+		if t.session != nil && !d.cfg.NoAudio && t.session.HasAudio() {
 			sessions = append(sessions, t.session)
 		}
 	}
 	d.mu.Unlock()
+
+	if len(sessions) == 0 {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		return d.statusResponseLocked(false, "no active audio stream")
+	}
 
 	var lastErr error
 	for _, s := range sessions {
@@ -1728,6 +1734,9 @@ func (d *Daemon) handleSetMute(req Request, muted bool) Response {
 
 	d.mu.Lock()
 	for _, t := range targets {
+		if t.session == nil || d.cfg.NoAudio || !t.session.HasAudio() {
+			continue
+		}
 		t.audioMuted = muted
 	}
 	defer d.mu.Unlock()
