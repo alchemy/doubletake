@@ -298,3 +298,23 @@ func assertDaemonMutexAvailable(t *testing.T, d *Daemon, release, done chan stru
 		t.Fatal("daemon mutex remained locked during blocking cleanup")
 	}
 }
+
+func TestExtendedDesktopCaptureGroupsArePerReceiver(t *testing.T) {
+	first := &activeStream{deviceIP: "192.0.2.1"}
+	second := &activeStream{deviceIP: "192.0.2.2"}
+	d := &Daemon{}
+	key := func(entry *activeStream) videoCaptureKey {
+		return d.videoCaptureKey(entry, 1920, 1080, airplay.VideoCodecH264)
+	}
+	if key(first) != key(second) {
+		t.Fatal("mirror sessions should share their capture")
+	}
+	d.cfg.ExtendSize = "1920x1080"
+	if key(first) == key(second) {
+		t.Fatal("extended desktops must not share a capture")
+	}
+	sameReceiver := &activeStream{deviceIP: first.deviceIP}
+	if key(first) != key(sameReceiver) {
+		t.Fatal("capture identity must remain stable across setup retry")
+	}
+}

@@ -28,6 +28,7 @@ before rebuilding to reproduce the same source version.
 - FairPlay SAP authentication (clean Go implementation)
 - SRP-6a pairing with PIN and persistent credential storage
 - Wayland (PipeWire/xdg-desktop-portal) and X11 screen capture
+- Hyprland extend mode with a temporary virtual monitor per receiver
 - H.264 encoding with NVENC, VA-API, OpenH264, and x264
 - Capability-gated HEVC Main10/high-resolution encoding with NVENC or x265
 - ChaCha20-Poly1305 stream encryption
@@ -36,6 +37,46 @@ before rebuilding to reproduce the same source version.
 - In-process test receiver for hardware-free pairing and media-flow tests
 - Automatic AirPlay screen/audio latency policy with an optional `-target-latency-ms` override
 - KDE Plasma widget for quick access (see [plasmoid/](plasmoid/))
+
+## Extend your desktop (Hyprland)
+
+```sh
+./bin/doubletake -extend -target TV_IP
+# Choose another desktop size:
+./bin/doubletake -extend -extend-size 1280x720 -target TV_IP
+```
+
+Doubletake creates a temporary monitor named `doubletake-…`, placed automatically
+beside your existing monitors. **Select that monitor in the sharing picker**, then
+move windows onto it using your usual Hyprland workspace/window controls. Choosing
+a physical monitor in the picker will share that monitor instead; the portal does
+not let doubletake force the selection. Saved mirror selections are ignored and
+extend selections do not overwrite your saved mirror token.
+
+The default desktop is 1920×1080 at scale 1, with the `-fps` refresh rate. It is
+scaled to the receiver's negotiated video canvas. This uses the existing AirPlay
+mirroring transport; the receiver needs no special extend capability. Audio still
+captures the computer's desktop audio, not only applications on the virtual monitor.
+
+Daemon mode supports the same flags:
+
+```sh
+./bin/doubletake -daemonize -extend -extend-size 1920x1080
+./bin/doubletake-ctl connect TV_IP
+```
+
+Each connected receiver gets an independent desktop. Mode and desktop size are
+chosen when starting the daemon; the existing plugin/controller can connect and
+disconnect receivers, but cannot switch modes in an already-running daemon.
+
+Requirements: a running Hyprland session, `hyprctl`, and a working Wayland sharing
+portal/PipeWire setup. Other compositors and X11 extend are not implemented.
+`-extend` cannot be combined with `-test` or X11 window capture.
+
+The monitor is removed on normal disconnect, cancellation, and handled setup errors;
+no desktop configuration files are edited. After a forced kill or process crash,
+a monitor may remain. Identify it with `hyprctl monitors all`, then remove only its
+exact name with `hyprctl output remove doubletake-NAME`.
 
 ## Requirements
 

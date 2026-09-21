@@ -86,6 +86,8 @@ type DeviceInfo struct {
 
 // Config holds daemon configuration.
 type Config struct {
+	ExtendSize string
+
 	SocketPath  string
 	CredFile    string
 	CredBackend string
@@ -217,8 +219,10 @@ type activeStream struct {
 
 // videoCaptureKey identifies captures which can safely share one encoded
 // stream. Capture settings are daemon-wide, so only the receiver's nominal
-// canvas and codec vary between concurrent targets.
+// canvas and codec vary between mirror targets. Extend adds a receiver identity.
 type videoCaptureKey struct {
+	source string // receiver identity for independent extended desktops
+
 	maxWidth  int
 	maxHeight int
 	codec     airplay.VideoCodec
@@ -324,6 +328,12 @@ type Daemon struct {
 
 // New creates a new Daemon with the given configuration.
 func New(cfg Config) (*Daemon, error) {
+	if _, _, err := airplay.ParseExtendSize(cfg.ExtendSize); err != nil {
+		return nil, err
+	}
+	if cfg.ExtendSize != "" && cfg.TestMode {
+		return nil, fmt.Errorf("extend mode cannot use synthetic capture")
+	}
 	if err := airplay.ValidateHWAccel(cfg.HWAccel); err != nil {
 		return nil, fmt.Errorf("hwaccel: %w", err)
 	}
@@ -1127,7 +1137,7 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 	var broadcast *airplay.BroadcastCapture
 	selectedCaptureKey := videoCaptureKey{maxWidth: -1, maxHeight: -1}
 	prepareVideo := func(width, height int, codec airplay.VideoCodec) (airplay.VideoPreparationResult, error) {
-		key := normalizedVideoCaptureKey(width, height, codec)
+		key := d.videoCaptureKey(entry, width, height, codec)
 		if broadcast != nil {
 			if key.codec == selectedCaptureKey.codec {
 				if key.maxWidth != selectedCaptureKey.maxWidth || key.maxHeight != selectedCaptureKey.maxHeight {
@@ -1286,6 +1296,15 @@ func retryMirrorSetupAfterDigestChallenge(
 // normalizedVideoCaptureKey matches the even canvas which the capture pipeline
 // will actually encode. Invalid or incomplete dimensions share the unconstrained
 // group instead of accidentally constraining one axis only.
+// Mirroring can share a capture; extended desktops must remain per receiver.
+func (d *Daemon) videoCaptureKey(entry *activeStream, width, height int, codec airplay.VideoCodec) videoCaptureKey {
+	key := normalizedVideoCaptureKey(width, height, codec)
+	if d.cfg.ExtendSize != "" {
+		key.source = entry.deviceIP
+	}
+	return key
+}
+
 func normalizedVideoCaptureKey(maxW, maxH int, codecs ...airplay.VideoCodec) videoCaptureKey {
 	codec := airplay.VideoCodecH264
 	if len(codecs) > 0 && codecs[0] != "" {
@@ -1307,6 +1326,7 @@ func (d *Daemon) prepareVideoCapture(ctx context.Context, restoreToken, deviceID
 	defer d.capturePortalMu.Unlock()
 
 	cfg := airplay.CaptureConfig{
+		ExtendSize:   d.cfg.ExtendSize,
 		FPS:          d.cfg.FPS,
 		Bitrate:      d.cfg.Bitrate,
 		HWAccel:      d.cfg.HWAccel,
@@ -1333,7 +1353,7 @@ func (d *Daemon) getOrStartPreparedCaptureGroup(ctx context.Context, entry *acti
 	d.captureStartMu.Lock()
 	defer d.captureStartMu.Unlock()
 
-	key := normalizedVideoCaptureKey(width, height, codec)
+	key := d.videoCaptureKey(entry, width, height, codec)
 	d.mu.Lock()
 	if d.streams[entry.deviceIP] != entry {
 		d.mu.Unlock()
@@ -1439,7 +1459,7 @@ func (d *Daemon) getOrStartCaptureGroup(entry *activeStream, restoreToken, devic
 		// a concrete per-session codec to getOrStartPreparedCaptureGroup instead.
 		codec = airplay.VideoCodecH264
 	}
-	key := normalizedVideoCaptureKey(maxW, maxH, codec)
+	key := d.videoCaptureKey(entry, maxW, maxH, codec)
 	d.mu.Lock()
 	if d.streams[entry.deviceIP] != entry {
 		d.mu.Unlock()
@@ -1468,6 +1488,7 @@ func (d *Daemon) getOrStartCaptureGroup(entry *activeStream, restoreToken, devic
 	d.mu.Unlock()
 
 	capCfg := airplay.CaptureConfig{
+		ExtendSize:   d.cfg.ExtendSize,
 		FPS:          d.cfg.FPS,
 		Bitrate:      d.cfg.Bitrate,
 		HWAccel:      d.cfg.HWAccel,
