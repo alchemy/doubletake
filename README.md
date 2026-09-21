@@ -64,9 +64,19 @@ Daemon mode supports the same flags:
 ./bin/doubletake-ctl connect TV_IP
 ```
 
-Each connected receiver gets an independent desktop. Mode and desktop size are
-chosen when starting the daemon; the existing plugin/controller can connect and
-disconnect receivers, but cannot switch modes in an already-running daemon.
+Each extended receiver gets an independent desktop. A single daemon can mix
+mirror and extend sessions; choose the mode when connecting:
+
+```sh
+./bin/doubletake-ctl -mode extend -extend-size 1280x720 connect TV_IP
+./bin/doubletake-ctl -mode mirror connect OTHER_TV_IP
+```
+
+Socket clients send `mode: "mirror"` or `mode: "extend"` and optional
+`extend_size: "1280x720"` on the initial `connect` request. Omitted mode uses the
+daemon startup default, preserving compatibility with existing clients. Status
+reports `mode` and `extend_size` per stream. Disconnect and reconnect to change
+an existing session's mode; PIN/password submissions retain its original mode.
 
 ### Hyprland picker integration
 

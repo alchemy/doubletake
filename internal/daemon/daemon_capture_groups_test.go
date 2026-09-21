@@ -318,3 +318,43 @@ func TestExtendedDesktopCaptureGroupsArePerReceiver(t *testing.T) {
 		t.Fatal("capture identity must remain stable across setup retry")
 	}
 }
+
+func TestSessionModeDefaultsAndOverrides(t *testing.T) {
+	for _, tt := range []struct {
+		mode, size, defaultSize, wantMode, wantSize string
+		invalid                                     bool
+	}{
+		{wantMode: "mirror"},
+		{defaultSize: "1280x720", wantMode: "extend", wantSize: "1280x720"},
+		{mode: "mirror", defaultSize: "1280x720", wantMode: "mirror"},
+		{mode: "extend", wantMode: "extend", wantSize: "1920x1080"},
+		{mode: "extend", size: "1280x720", wantMode: "extend", wantSize: "1280x720"},
+		{mode: "invalid", invalid: true},
+		{mode: "mirror", size: "1280x720", invalid: true},
+		{mode: "extend", size: "bad", invalid: true},
+	} {
+		mode, size, err := resolveSessionMode(tt.mode, tt.size, tt.defaultSize)
+		if (err != nil) != tt.invalid || mode != tt.wantMode || size != tt.wantSize {
+			t.Fatalf("%+v: got %s/%s, %v", tt, mode, size, err)
+		}
+	}
+}
+
+func TestMixedSessionCaptureIsolation(t *testing.T) {
+	d := &Daemon{cfg: Config{ExtendSize: "1920x1080"}}
+	mirror := &activeStream{deviceIP: "192.0.2.1", mode: "mirror"}
+	extend := &activeStream{deviceIP: "192.0.2.2", mode: "extend", extendSize: "1280x720"}
+	other := &activeStream{deviceIP: "192.0.2.3", mode: "extend", extendSize: "1280x720"}
+	if d.streamExtendSize(mirror) != "" || d.streamExtendSize(extend) != "1280x720" {
+		t.Fatal("per-session modes did not override daemon default")
+	}
+	key := func(e *activeStream) videoCaptureKey { return d.videoCaptureKey(e, 1280, 720, airplay.VideoCodecH264) }
+	if key(mirror) == key(extend) || key(extend) == key(other) {
+		t.Fatal("independent sources share a capture")
+	}
+	d.streams = map[string]*activeStream{mirror.deviceIP: mirror, extend.deviceIP: extend}
+	status := d.handleStatus()
+	if status.Streams[0].Mode != "mirror" || status.Streams[1].Mode != "extend" || status.Streams[1].ExtendSize != "1280x720" {
+		t.Fatalf("wrong modes in status: %+v", status.Streams)
+	}
+}

@@ -41,14 +41,18 @@ const (
 
 // Request is a command sent to the daemon over the control socket.
 type Request struct {
-	Cmd    string `json:"cmd"`
-	Target string `json:"target,omitempty"`
-	Port   int    `json:"port,omitempty"`
-	Pin    string `json:"pin,omitempty"`
+	Mode       string `json:"mode,omitempty"`
+	ExtendSize string `json:"extend_size,omitempty"`
+	Cmd        string `json:"cmd"`
+	Target     string `json:"target,omitempty"`
+	Port       int    `json:"port,omitempty"`
+	Pin        string `json:"pin,omitempty"`
 }
 
 // StreamInfo describes one active (or connecting) mirror stream.
 type StreamInfo struct {
+	Mode           string         `json:"mode"`
+	ExtendSize     string         `json:"extend_size,omitempty"`
 	Device         string         `json:"device"`
 	DeviceIP       string         `json:"device_ip"`
 	State          State          `json:"state"`
@@ -203,6 +207,8 @@ func removeStaleSocket(socketPath string) error {
 
 // activeStream tracks the state of a single mirroring session to one receiver.
 type activeStream struct {
+	mode           string
+	extendSize     string
 	device         string // friendly name
 	deviceIP       string
 	deviceID       string
@@ -604,6 +610,8 @@ func (d *Daemon) statusResponseLocked(ok bool, errMsg string) Response {
 	streams := make([]StreamInfo, 0, len(d.streams))
 	for _, s := range d.streams {
 		streams = append(streams, StreamInfo{
+			Mode:           s.mode,
+			ExtendSize:     s.extendSize,
 			Device:         s.device,
 			DeviceIP:       s.deviceIP,
 			State:          s.state,
@@ -788,10 +796,22 @@ func (d *Daemon) handleConnect(req Request) Response {
 		port = 7000
 	}
 
+	mode, extendSize, err := resolveSessionMode(req.Mode, req.ExtendSize, d.cfg.ExtendSize)
+	if err != nil || (mode == "extend" && d.cfg.TestMode) {
+		if err == nil {
+			err = fmt.Errorf("extend mode cannot use synthetic capture")
+		}
+		state := d.overallStateLocked()
+		d.mu.Unlock()
+		return Response{OK: false, State: state, Error: err.Error()}
+	}
+
 	// Create the context before publishing the entry so a concurrent disconnect
 	// can always cancel the connection goroutine.
 	connCtx, cancel := context.WithCancel(context.Background())
 	entry := &activeStream{
+		mode:         mode,
+		extendSize:   extendSize,
 		deviceIP:     target,
 		state:        StateConnecting,
 		cancelFn:     cancel,
@@ -1125,7 +1145,7 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 	// not start an encoder until control SETUP exposes session-time display info.
 	// This preserves the receiver deadline while avoiding the provisional 720p
 	// fallback used by receivers whose public /info omits displays.
-	capturePreparation, err := d.prepareVideoCapture(ctx, screenCastRestoreToken, deviceID)
+	capturePreparation, err := d.prepareVideoCapture(ctx, screenCastRestoreToken, deviceID, d.streamExtendSize(entry))
 	if err != nil {
 		removeStream(fmt.Sprintf("prepare capture failed: %v", err))
 		return
@@ -1296,10 +1316,47 @@ func retryMirrorSetupAfterDigestChallenge(
 // normalizedVideoCaptureKey matches the even canvas which the capture pipeline
 // will actually encode. Invalid or incomplete dimensions share the unconstrained
 // group instead of accidentally constraining one axis only.
+// Empty request mode preserves the daemon's configured default for old clients.
+func resolveSessionMode(mode, size, defaultSize string) (string, string, error) {
+	if mode == "" {
+		mode = "mirror"
+		if defaultSize != "" {
+			mode = "extend"
+		}
+	}
+	switch mode {
+	case "mirror":
+		if size != "" {
+			return "", "", fmt.Errorf("extend_size requires mode extend")
+		}
+		return mode, "", nil
+	case "extend":
+		if size == "" {
+			size = defaultSize
+		}
+		if size == "" {
+			size = "1920x1080"
+		}
+		if _, _, err := airplay.ParseExtendSize(size); err != nil {
+			return "", "", err
+		}
+		return mode, size, nil
+	default:
+		return "", "", fmt.Errorf("mode must be mirror or extend")
+	}
+}
+
+func (d *Daemon) streamExtendSize(entry *activeStream) string {
+	if entry.mode == "" {
+		return d.cfg.ExtendSize
+	}
+	return entry.extendSize
+}
+
 // Mirroring can share a capture; extended desktops must remain per receiver.
 func (d *Daemon) videoCaptureKey(entry *activeStream, width, height int, codec airplay.VideoCodec) videoCaptureKey {
 	key := normalizedVideoCaptureKey(width, height, codec)
-	if d.cfg.ExtendSize != "" {
+	if d.streamExtendSize(entry) != "" {
 		key.source = entry.deviceIP
 	}
 	return key
@@ -1321,12 +1378,12 @@ func normalizedVideoCaptureKey(maxW, maxH int, codecs ...airplay.VideoCodec) vid
 // reveals the session-time display canvas. Portal serialization is deliberately
 // separate from captureStartMu: a different user prompt must not block an
 // already-negotiated receiver from starting its encoder before its deadline.
-func (d *Daemon) prepareVideoCapture(ctx context.Context, restoreToken, deviceID string) (*airplay.CapturePreparation, error) {
+func (d *Daemon) prepareVideoCapture(ctx context.Context, restoreToken, deviceID, extendSize string) (*airplay.CapturePreparation, error) {
 	d.capturePortalMu.Lock()
 	defer d.capturePortalMu.Unlock()
 
 	cfg := airplay.CaptureConfig{
-		ExtendSize:   d.cfg.ExtendSize,
+		ExtendSize:   extendSize,
 		FPS:          d.cfg.FPS,
 		Bitrate:      d.cfg.Bitrate,
 		HWAccel:      d.cfg.HWAccel,
@@ -1488,7 +1545,7 @@ func (d *Daemon) getOrStartCaptureGroup(entry *activeStream, restoreToken, devic
 	d.mu.Unlock()
 
 	capCfg := airplay.CaptureConfig{
-		ExtendSize:   d.cfg.ExtendSize,
+		ExtendSize:   d.streamExtendSize(entry),
 		FPS:          d.cfg.FPS,
 		Bitrate:      d.cfg.Bitrate,
 		HWAccel:      d.cfg.HWAccel,

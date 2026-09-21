@@ -89,3 +89,14 @@ Releases v0.3.2 and earlier were provided under GPLv3+: GNU GPL version 3 or lat
 This is free software: you are free to change and redistribute it.
 .PP
 There is NO WARRANTY, to the extent permitted by law.
+
+.SH PER-SESSION MODE
+Use global flags before the command:
+.PP
+.B doubletake-ctl -mode extend -extend-size 1280x720 connect TV_IP
+.PP
+.B doubletake-ctl -mode mirror connect OTHER_TV_IP
+.PP
+A daemon can host mirror and extend sessions simultaneously. Omitting -mode
+uses the daemon startup default. Each extended receiver gets its own desktop.
+Disconnect and reconnect to change an existing session's mode.
