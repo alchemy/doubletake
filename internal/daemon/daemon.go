@@ -61,14 +61,31 @@ type StreamInfo struct {
 	CredentialKind CredentialKind `json:"credential_kind,omitempty"`
 }
 
+// Capabilities describes implemented features, not environment readiness.
+// Older daemons omit this field; clients must treat absence as unknown support.
+type Capabilities struct {
+	SessionModes   []string `json:"session_modes"`
+	PerSessionMode bool     `json:"per_session_mode"`
+	ExtendBackends []string `json:"extend_backends"`
+}
+
+func implementedCapabilities() *Capabilities {
+	return &Capabilities{
+		SessionModes:   []string{"mirror", "extend"},
+		PerSessionMode: true,
+		ExtendBackends: []string{"hyprland"},
+	}
+}
+
 // Response is returned to the caller for every request.
 type Response struct {
-	OK         bool   `json:"ok"`
-	State      State  `json:"state"`
-	Device     string `json:"device,omitempty"`
-	DeviceIP   string `json:"device_ip,omitempty"`
-	HasAudio   bool   `json:"has_audio"`
-	AudioMuted bool   `json:"audio_muted"`
+	Capabilities *Capabilities `json:"capabilities,omitempty"`
+	OK           bool          `json:"ok"`
+	State        State         `json:"state"`
+	Device       string        `json:"device,omitempty"`
+	DeviceIP     string        `json:"device_ip,omitempty"`
+	HasAudio     bool          `json:"has_audio"`
+	AudioMuted   bool          `json:"audio_muted"`
 	// NeedsPIN is retained for older clients and is true only for an on-screen
 	// PIN. NeedsCredential and CredentialKind distinguish configured passwords.
 	NeedsPIN        bool           `json:"needs_pin,omitempty"`
@@ -654,6 +671,7 @@ func (d *Daemon) statusResponseLocked(ok bool, errMsg string) Response {
 	}
 
 	return Response{
+		Capabilities:    implementedCapabilities(),
 		OK:              ok,
 		State:           overall,
 		Device:          device,

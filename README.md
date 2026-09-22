@@ -78,6 +78,27 @@ daemon startup default, preserving compatibility with existing clients. Status
 reports `mode` and `extend_size` per stream. Disconnect and reconnect to change
 an existing session's mode; PIN/password submissions retain its original mode.
 
+### Detecting daemon features
+
+`doubletake-ctl status` (socket request `{"cmd":"status"}`) includes:
+
+```json
+"capabilities": {
+  "session_modes": ["mirror", "extend"],
+  "per_session_mode": true,
+  "extend_backends": ["hyprland"]
+}
+```
+
+These fields describe the running daemon's implemented features, regardless of
+idle/active state or reported connection errors. They do not probe the environment:
+Hyprland, its portal, and capture dependencies still need to be available.
+Clients should enable extend only when `session_modes` includes `extend`, and
+check `per_session_mode` before requesting modes on individual connections.
+A missing `capabilities` field means legacy/unknown support; do not infer extend
+support from a package name or from a newer binary installed while an older
+daemon is still running. Clients should ignore unknown fields and mode names.
+
 ### Hyprland picker integration
 
 On first use, extend mode installs `hyprland-picker.sh` under
