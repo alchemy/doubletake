@@ -546,3 +546,18 @@ Since I assume most of the code for this project was trained from [UxPlay](https
 This project is licensed under the [GNU Lesser General Public License v3.0 or later](LICENSE) (`LGPL-3.0-or-later`). See the LICENSE file for the LGPL terms and [COPYING.GPL](COPYING.GPL) for the incorporated GPLv3 terms.
 
 Releases v0.3.2 and earlier were provided under the GNU General Public License v3.0 or later (`GPL-3.0-or-later`).
+
+## Prebuilt fork releases
+
+Fork releases from `v0.4.0-alchemy.2` publish
+`doubletake-VERSION-linux-amd64.tar.gz` and
+`doubletake-VERSION-linux-arm64.tar.gz`, each with a `.sha256` checksum file.
+Each archive contains the three executables, manpages, documentation, licenses,
+and VERSION/REVISION files. Go is not needed to run them; GStreamer and the
+runtime requirements above are still required. The binaries use the default
+ALAC audio build, without optional FDK AAC-ELD. Arm64 is cross-compiled; this
+does not establish hardware capture compatibility on every arm64 system.
+
+For maintainers, `bash scripts/build-release.sh VERSION ARCH [OUTPUT_DIR]`
+builds the same archive layout locally. Tag-triggered CI tests the source,
+builds both architectures, and publishes the archives and checksums.
