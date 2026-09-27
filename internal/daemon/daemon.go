@@ -1244,7 +1244,13 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 	}
 	// Attach only after SETUP succeeds. This avoids buffering encoded data for a
 	// receiver which is still pairing, prompting, or negotiating its media ports.
-	sink := broadcast.AddSink()
+	sink, err := d.addCaptureSink(entry, broadcast)
+	if err != nil {
+		d.mu.Unlock()
+		_ = session.Close()
+		removeStream(fmt.Sprintf("attach capture sink: %v", err))
+		return
+	}
 	current.state = StateStreaming
 	current.session = session
 	current.client = client
@@ -1369,6 +1375,16 @@ func (d *Daemon) streamExtendSize(entry *activeStream) string {
 		return d.cfg.ExtendSize
 	}
 	return entry.extendSize
+}
+
+// Extended outputs have a private encoder, so network stalls can propagate to
+// its leaky raw-frame queue instead of disconnecting at the shared relay limit.
+// Mirroring retains independent queues so a slow receiver cannot stall peers.
+func (d *Daemon) addCaptureSink(entry *activeStream, broadcast *airplay.BroadcastCapture) (*airplay.BroadcastSink, error) {
+	if d.streamExtendSize(entry) != "" {
+		return broadcast.AddBackpressuredSink()
+	}
+	return broadcast.AddSink(), nil
 }
 
 // Mirroring can share a capture; extended desktops must remain per receiver.

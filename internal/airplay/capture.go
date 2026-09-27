@@ -39,6 +39,7 @@ type CaptureConfig struct {
 
 	ShowCursor bool // show the mouse cursor in the captured video (Wayland and X11)
 
+	// Legacy fields retained for callers; capture always requests a fresh selection.
 	RestoreToken     string
 	SaveRestoreToken func(string) error
 }
@@ -237,21 +238,13 @@ func PrepareCapture(ctx context.Context, cfg CaptureConfig) (*CapturePreparation
 			return nil, err
 		}
 		defer os.Remove(marker)
-
-		// A physical-monitor restore token must never silently override extend.
-		cfg.RestoreToken = ""
-		cfg.SaveRestoreToken = nil
 	}
-	nodeID, pwFd, dbusConn, restoreToken, err := requestScreencast(ctx, cfg.RestoreToken, cfg.ShowCursor, &preparation.streamSize)
+	nodeID, pwFd, dbusConn, _, err := requestScreencast(ctx, cfg.ShowCursor, &preparation.streamSize)
 	if err != nil {
 		preparation.Close()
 		return nil, fmt.Errorf("screencast portal: %w", err)
 	}
-	if restoreToken != "" && cfg.SaveRestoreToken != nil {
-		if err := cfg.SaveRestoreToken(restoreToken); err != nil {
-			log.Printf("[CAPTURE] warning: failed to save screencast restore token: %v", err)
-		}
-	}
+
 	dbg("pipewire node ID: %d", nodeID)
 	preparation.pwNodeID = nodeID
 	preparation.pwFd = pwFd
@@ -1600,11 +1593,32 @@ func vbvBufferKbit(bitrateKbps, fps int) int {
 	return vbv
 }
 
+func screencastSourceOptions(baseToken string, showCursor bool, portalVersion uint32) map[string]dbus.Variant {
+	cursorMode := uint32(1)
+	if showCursor {
+		cursorMode = 2
+	}
+
+	// Select sources (screen)
+	selectOpts := map[string]dbus.Variant{
+		"handle_token": dbus.MakeVariant(baseToken + "_select"),
+		"types":        dbus.MakeVariant(uint32(1)), // MONITOR=1, WINDOW=2
+		"multiple":     dbus.MakeVariant(false),
+		"cursor_mode":  dbus.MakeVariant(cursorMode),
+	}
+	if portalVersion >= 4 {
+		// Mirror connections must show the picker each time. Extend connections
+		// select their fresh virtual monitor through the one-shot picker marker.
+		selectOpts["persist_mode"] = dbus.MakeVariant(uint32(0))
+	}
+	return selectOpts
+}
+
 // requestScreencast uses the xdg-desktop-portal D-Bus API to request screen capture
 // permission and returns a PipeWire node ID, an fd for the portal's PipeWire remote,
 // the D-Bus connection (which must stay open to keep the screencast session alive),
 // and a fresh restore token when the portal grants persistence.
-func requestScreencast(ctx context.Context, restoreToken string, showCursor bool, dimensions *[2]int) (uint32, *os.File, *dbus.Conn, string, error) {
+func requestScreencast(ctx context.Context, showCursor bool, dimensions *[2]int) (uint32, *os.File, *dbus.Conn, string, error) {
 	conn, err := dbus.ConnectSessionBus()
 	if err != nil {
 		return 0, nil, nil, "", fmt.Errorf("connect session bus: %w", err)
@@ -1644,26 +1658,7 @@ func requestScreencast(ctx context.Context, restoreToken string, showCursor bool
 		return 0, nil, nil, "", fmt.Errorf("session handle: %w", err)
 	}
 
-	// cursor_mode: HIDDEN=1, EMBEDDED=2 (cursor baked into the stream)
-	cursorMode := uint32(1)
-	if showCursor {
-		cursorMode = 2
-	}
-
-	// Select sources (screen)
-	selectOpts := map[string]dbus.Variant{
-		"handle_token": dbus.MakeVariant(baseToken + "_select"),
-		"types":        dbus.MakeVariant(uint32(1)), // MONITOR=1, WINDOW=2
-		"multiple":     dbus.MakeVariant(false),
-		"cursor_mode":  dbus.MakeVariant(cursorMode),
-	}
-	if portalVersion >= 4 {
-		selectOpts["persist_mode"] = dbus.MakeVariant(uint32(2))
-		if restoreToken != "" {
-			selectOpts["restore_token"] = dbus.MakeVariant(restoreToken)
-			dbg("[CAPTURE] requesting screencast restore with saved token")
-		}
-	}
+	selectOpts := screencastSourceOptions(baseToken, showCursor, portalVersion)
 
 	requestHandle = ""
 	call = portal.Call("org.freedesktop.portal.ScreenCast.SelectSources", 0,

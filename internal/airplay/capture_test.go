@@ -843,3 +843,29 @@ func TestVAWaylandPipelineKeepsFramesInVAMemory(t *testing.T) {
 		}
 	}
 }
+
+func TestScreencastSelectionDoesNotRestoreOrPersist(t *testing.T) {
+	for _, version := range []uint32{3, 4, 5} {
+		for _, cursor := range []bool{false, true} {
+			opts := screencastSourceOptions("test", cursor, version)
+			if _, ok := opts["restore_token"]; ok {
+				t.Fatal("restore token would bypass the mirror picker")
+			}
+			persist, ok := opts["persist_mode"]
+			if version >= 4 {
+				if !ok || persist.Value() != uint32(0) {
+					t.Fatalf("version %d persistence = %v, want disabled", version, persist)
+				}
+			} else if ok {
+				t.Fatal("old portal must not receive unsupported persistence option")
+			}
+			wantCursor := uint32(1)
+			if cursor {
+				wantCursor = 2
+			}
+			if opts["cursor_mode"].Value() != wantCursor {
+				t.Fatal("cursor preference lost")
+			}
+		}
+	}
+}

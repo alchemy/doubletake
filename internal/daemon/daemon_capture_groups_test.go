@@ -358,3 +358,38 @@ func TestMixedSessionCaptureIsolation(t *testing.T) {
 		t.Fatalf("wrong modes in status: %+v", status.Streams)
 	}
 }
+
+func TestCaptureSinkPolicyMatchesSessionIsolation(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		defaultSize string
+		entry       activeStream
+		exclusive   bool
+	}{
+		{name: "mirror", entry: activeStream{mode: "mirror"}},
+		{name: "extend", entry: activeStream{mode: "extend", extendSize: "1920x1080"}, exclusive: true},
+		{name: "legacy extend default", defaultSize: "1920x1080", exclusive: true},
+		{name: "mirror overrides extend default", defaultSize: "1920x1080", entry: activeStream{mode: "mirror"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := &Daemon{cfg: Config{ExtendSize: tc.defaultSize}}
+			broadcast := airplay.NewBroadcastCapture(nil)
+			sink, err := d.addCaptureSink(&tc.entry, broadcast)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer sink.Close()
+			sink.Close()
+			// A private capture stays exclusively reserved even after removal.
+			// A shared capture can accept a new owner once all peers leave.
+			probe, probeErr := broadcast.AddBackpressuredSink()
+			if probe != nil {
+				defer probe.Close()
+			}
+			if (probeErr != nil) != tc.exclusive {
+				t.Fatalf("exclusive = %v, registration error = %v", tc.exclusive, probeErr)
+			}
+
+		})
+	}
+}
