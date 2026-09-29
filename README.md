@@ -63,11 +63,14 @@ The `openh264` encoder requires the GStreamer `openh264enc` element, normally
 provided by the plugins-bad package. Check availability with
 `gst-inspect-1.0 openh264enc`.
 
-You can also install from the AUR:
+You can also install this Alchemy fork from the AUR. Both packages install the
+forked version of doubletake, including Hyprland extend mode and per-connection
+mode selection:
 
-- [`doubletake`](https://aur.archlinux.org/packages/doubletake) (stable release package)
-- [`doubletake-git`](https://aur.archlinux.org/packages/doubletake-git) (latest from git)
-- [`doubletake-bin`](https://aur.archlinux.org/packages/doubletake-bin) (prebuilt binary package)
+- [`doubletake-alchemy`](https://aur.archlinux.org/packages/doubletake-alchemy) — builds the fork's tagged release from source.
+- [`doubletake-alchemy-bin`](https://aur.archlinux.org/packages/doubletake-alchemy-bin) — installs prebuilt binaries from the fork's GitHub release.
+
+Choose one package. Both provide the `doubletake` and `doubletake-ctl` commands.
 
 ### Receiver timing compatibility
 
