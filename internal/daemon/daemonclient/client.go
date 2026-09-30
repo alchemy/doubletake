@@ -44,6 +44,11 @@ func (c *Client) Connect(target string, port int, pin string) (*daemon.Response,
 	return c.send(daemon.Request{Cmd: "connect", Target: target, Port: port, Pin: pin})
 }
 
+// ConnectWithMode selects a per-receiver desktop mode without changing other sessions.
+func (c *Client) ConnectWithMode(target string, port int, pin, mode, extendSize string) (*daemon.Response, error) {
+	return c.send(daemon.Request{Cmd: "connect", Target: target, Port: port, Pin: pin, Mode: mode, ExtendSize: extendSize})
+}
+
 // Disconnect stops all active mirroring sessions.
 func (c *Client) Disconnect() (*daemon.Response, error) {
 	return c.send(daemon.Request{Cmd: "disconnect"})

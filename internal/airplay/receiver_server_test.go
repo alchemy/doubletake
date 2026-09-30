@@ -79,6 +79,9 @@ func TestReceiverServerEndToEndProfiles(t *testing.T) {
 				stats.TimingProbes < test.wantTiming || stats.TimingReplies < test.wantTiming) && time.Now().Before(deadline) {
 				time.Sleep(time.Millisecond)
 				stats = server.Stats()
+				if stats.ParameterRequests != 0 {
+					t.Fatalf("setup changed receiver parameters: %d requests", stats.ParameterRequests)
+				}
 			}
 			if err := session.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 				t.Fatalf("close mirror session: %v", err)

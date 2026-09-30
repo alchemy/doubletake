@@ -101,6 +101,25 @@ Enable verbose protocol logging
 .B \-daemonize
 Run in daemon mode for multi-target control via
 .B doubletake-ctl
+.TP
+.B \-extend
+Extend the desktop with a temporary Hyprland headless monitor, selected
+automatically through a one-shot custom picker. Move windows onto the new monitor.
+On first use, installs a fallback-preserving wrapper in the user data directory,
+adds a marked block to xdph.conf, and restarts the Hyprland portal. That initial
+restart interrupts other screen shares. Later connections need no restart.
+Avoid simultaneous sharing requests from other apps during startup: the picker
+hook has no requester identity, so another app can consume the one-shot target.
+Requires Hyprland and hyprctl. Also supported with \-daemonize; each receiver
+gets its own desktop. Saved mirror selections are not used or overwritten.
+The monitor is removed on normal disconnect and handled setup failures.
+After a forced kill, remove a leftover monitor by its exact name using
+.BR "hyprctl output remove NAME" .
+.TP
+.B \-extend-size \fIWIDTHxHEIGHT\fR
+Virtual desktop size when using \-extend (default: 1920x1080). Scale is 1 and
+refresh rate follows \-fps. The desktop is scaled to the receiver's video canvas.
+Cannot combine \-extend with \-test or X11 window capture.
 .SH EXAMPLES
 .TP
 Discover and connect to any Apple TV on the network:

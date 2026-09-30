@@ -21,6 +21,8 @@ import (
 
 // CaptureConfig holds screen capture settings.
 type CaptureConfig struct {
+	ExtendSize string // empty mirrors; WIDTHxHEIGHT creates a Hyprland desktop
+
 	FPS        int
 	Bitrate    int        // Video bitrate in kbps (0 = auto)
 	HWAccel    string     // "auto", "nvenc", "vaapi", "openh264", or "none"
@@ -37,6 +39,7 @@ type CaptureConfig struct {
 
 	ShowCursor bool // show the mouse cursor in the captured video (Wayland and X11)
 
+	// Legacy fields retained for callers; capture always requests a fresh selection.
 	RestoreToken     string
 	SaveRestoreToken func(string) error
 }
@@ -65,6 +68,9 @@ const (
 
 // ScreenCapture manages screen capture via GStreamer.
 type ScreenCapture struct {
+	stopOnce       sync.Once
+	extendedOutput *extendedOutput
+
 	cmd      *exec.Cmd // gst-launch-1.0 process
 	stdout   io.ReadCloser
 	frames   videoAccessUnitReader
@@ -93,6 +99,8 @@ const (
 //
 // A preparation is single-use. Call Close when it will not be started.
 type CapturePreparation struct {
+	extendedOutput *extendedOutput
+
 	mu   sync.Mutex
 	ctx  context.Context
 	cfg  CaptureConfig
@@ -134,6 +142,12 @@ func StartCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, error
 // is acquired immediately; X11 needs no external session and is merely
 // validated until Start is called.
 func PrepareCapture(ctx context.Context, cfg CaptureConfig) (*CapturePreparation, error) {
+	if _, _, err := ParseExtendSize(cfg.ExtendSize); err != nil {
+		return nil, err
+	}
+	if cfg.ExtendSize != "" && (cfg.X11WindowID != 0 || cfg.X11WindowName != "") {
+		return nil, fmt.Errorf("extend mode cannot capture an X11 window")
+	}
 	if err := ValidateVideoCodec(string(cfg.VideoCodec)); err != nil {
 		return nil, err
 	}
@@ -149,6 +163,9 @@ func PrepareCapture(ctx context.Context, cfg CaptureConfig) (*CapturePreparation
 		return nil, fmt.Errorf("no display server detected (neither WAYLAND_DISPLAY nor DISPLAY is set)")
 	}
 
+	if cfg.ExtendSize != "" && kind != capturePreparationWayland {
+		return nil, fmt.Errorf("extend mode requires Hyprland Wayland")
+	}
 	validationCfg := cfg
 	if validationCfg.VideoCodec == VideoCodecAuto {
 		// Auto always retains a working H.264 fallback. HEVC is selected only
@@ -191,15 +208,43 @@ func PrepareCapture(ctx context.Context, cfg CaptureConfig) (*CapturePreparation
 	if err := exec.Command("gst-inspect-1.0", "pipewiresrc").Run(); err != nil {
 		return nil, fmt.Errorf("GStreamer 'pipewiresrc' plugin not found; install gst-pipewire")
 	}
-	nodeID, pwFd, dbusConn, restoreToken, err := requestScreencast(ctx, cfg.RestoreToken, cfg.ShowCursor, &preparation.streamSize)
+	// Hold the acquisition lock through the portal reply, including mirror
+	// requests, so our own processes cannot consume another extend marker.
+	marker := ""
+	if os.Getenv("HYPRLAND_INSTANCE_SIGNATURE") != "" {
+		lock, path, err := lockExtendPicker(ctx)
+		if err != nil {
+			return nil, err
+		}
+		defer lock.Close()
+		marker = path
+		_ = os.Remove(marker) // discard a stale marker left by an interrupted request
+	}
+	if cfg.ExtendSize != "" {
+		if marker == "" {
+			return nil, fmt.Errorf("extend mode requires Hyprland")
+		}
+		if err := ensureExtendPicker(ctx); err != nil {
+			return nil, err
+		}
+		output, err := prepareExtendedOutput(ctx, cfg.ExtendSize, cfg.FPS)
+		if err != nil {
+			return nil, err
+		}
+		preparation.extendedOutput = output
+		request := fmt.Sprintf("%d %d %s\n", os.Getpid(), time.Now().Add(30*time.Second).Unix(), output.name)
+		if err := writePickerFile(marker, []byte(request), 0600); err != nil {
+			preparation.Close()
+			return nil, err
+		}
+		defer os.Remove(marker)
+	}
+	nodeID, pwFd, dbusConn, _, err := requestScreencast(ctx, cfg.ShowCursor, &preparation.streamSize)
 	if err != nil {
+		preparation.Close()
 		return nil, fmt.Errorf("screencast portal: %w", err)
 	}
-	if restoreToken != "" && cfg.SaveRestoreToken != nil {
-		if err := cfg.SaveRestoreToken(restoreToken); err != nil {
-			log.Printf("[CAPTURE] warning: failed to save screencast restore token: %v", err)
-		}
-	}
+
 	dbg("pipewire node ID: %d", nodeID)
 	preparation.pwNodeID = nodeID
 	preparation.pwFd = pwFd
@@ -211,6 +256,9 @@ func PrepareCapture(ctx context.Context, cfg CaptureConfig) (*CapturePreparation
 // GStreamer process. It mirrors PrepareCapture for callers that negotiate the
 // receiver canvas between preparation and encoder startup.
 func PrepareTestCapture(ctx context.Context, cfg CaptureConfig) (*CapturePreparation, error) {
+	if cfg.ExtendSize != "" {
+		return nil, fmt.Errorf("extend mode cannot use synthetic capture")
+	}
 	if err := ValidateVideoCodec(string(cfg.VideoCodec)); err != nil {
 		return nil, err
 	}
@@ -271,7 +319,7 @@ func (p *CapturePreparation) StartWithContextAndCodec(lifetime context.Context, 
 	return p.startWithContextAndCodec(lifetime, width, height, codec)
 }
 
-func (p *CapturePreparation) startWithContextAndCodec(lifetime context.Context, width, height int, selected VideoCodec) (*ScreenCapture, error) {
+func (p *CapturePreparation) startWithContextAndCodec(lifetime context.Context, width, height int, selected VideoCodec) (result *ScreenCapture, resultErr error) {
 	if p == nil {
 		return nil, fmt.Errorf("capture preparation is nil")
 	}
@@ -310,6 +358,15 @@ func (p *CapturePreparation) startWithContextAndCodec(lifetime context.Context, 
 		return nil, fmt.Errorf("automatic video codec has not been resolved")
 	}
 	p.used = true
+	output := p.extendedOutput
+	p.extendedOutput = nil
+	defer func() {
+		if result == nil {
+			output.Close()
+		} else {
+			result.extendedOutput = output
+		}
+	}()
 	cfg.MaxWidth = width
 	cfg.MaxHeight = height
 	kind := p.kind
@@ -403,6 +460,8 @@ func (p *CapturePreparation) Close() {
 		return
 	}
 	p.used = true
+	output := p.extendedOutput
+	p.extendedOutput = nil
 	pwFd := p.pwFd
 	dbusConn := p.dbusConn
 	p.pwFd = nil
@@ -414,6 +473,7 @@ func (p *CapturePreparation) Close() {
 	if dbusConn != nil {
 		_ = dbusConn.Close()
 	}
+	output.Close()
 }
 
 func hasGstElement(name string) bool {
@@ -1069,35 +1129,35 @@ func (sc *ScreenCapture) ReadVideoAccessUnit() (VideoAccessUnit, error) {
 }
 
 func (sc *ScreenCapture) Stop() {
-	if sc.stopped {
-		return
-	}
-	sc.stopped = true
-	if sc.cancel != nil {
-		sc.cancel()
-	}
-
-	// Close stdout to unblock any pending Read() call.
-	if sc.stdout != nil {
-		sc.stdout.Close()
-	}
-
-	if sc.dbusConn != nil {
-		sc.dbusConn.Close()
-	}
-
-	if sc.cmd != nil && sc.cmd.Process != nil {
-		_ = sc.cmd.Process.Signal(os.Interrupt)
-	}
-
-	select {
-	case <-sc.waitCh:
-	case <-time.After(2 * time.Second):
-		if sc.cmd != nil && sc.cmd.Process != nil {
-			_ = sc.cmd.Process.Kill()
+	sc.stopOnce.Do(func() {
+		sc.stopped = true
+		defer sc.extendedOutput.Close()
+		if sc.cancel != nil {
+			sc.cancel()
 		}
-		<-sc.waitCh
-	}
+
+		// Close stdout to unblock any pending Read() call.
+		if sc.stdout != nil {
+			sc.stdout.Close()
+		}
+
+		if sc.dbusConn != nil {
+			sc.dbusConn.Close()
+		}
+
+		if sc.cmd != nil && sc.cmd.Process != nil {
+			_ = sc.cmd.Process.Signal(os.Interrupt)
+		}
+
+		select {
+		case <-sc.waitCh:
+		case <-time.After(2 * time.Second):
+			if sc.cmd != nil && sc.cmd.Process != nil {
+				_ = sc.cmd.Process.Kill()
+			}
+			<-sc.waitCh
+		}
+	})
 }
 
 // detectPrimaryMonitor queries xrandr to find the primary monitor's geometry.
@@ -1533,11 +1593,32 @@ func vbvBufferKbit(bitrateKbps, fps int) int {
 	return vbv
 }
 
+func screencastSourceOptions(baseToken string, showCursor bool, portalVersion uint32) map[string]dbus.Variant {
+	cursorMode := uint32(1)
+	if showCursor {
+		cursorMode = 2
+	}
+
+	// Select sources (screen)
+	selectOpts := map[string]dbus.Variant{
+		"handle_token": dbus.MakeVariant(baseToken + "_select"),
+		"types":        dbus.MakeVariant(uint32(1)), // MONITOR=1, WINDOW=2
+		"multiple":     dbus.MakeVariant(false),
+		"cursor_mode":  dbus.MakeVariant(cursorMode),
+	}
+	if portalVersion >= 4 {
+		// Mirror connections must show the picker each time. Extend connections
+		// select their fresh virtual monitor through the one-shot picker marker.
+		selectOpts["persist_mode"] = dbus.MakeVariant(uint32(0))
+	}
+	return selectOpts
+}
+
 // requestScreencast uses the xdg-desktop-portal D-Bus API to request screen capture
 // permission and returns a PipeWire node ID, an fd for the portal's PipeWire remote,
 // the D-Bus connection (which must stay open to keep the screencast session alive),
 // and a fresh restore token when the portal grants persistence.
-func requestScreencast(ctx context.Context, restoreToken string, showCursor bool, dimensions *[2]int) (uint32, *os.File, *dbus.Conn, string, error) {
+func requestScreencast(ctx context.Context, showCursor bool, dimensions *[2]int) (uint32, *os.File, *dbus.Conn, string, error) {
 	conn, err := dbus.ConnectSessionBus()
 	if err != nil {
 		return 0, nil, nil, "", fmt.Errorf("connect session bus: %w", err)
@@ -1577,26 +1658,7 @@ func requestScreencast(ctx context.Context, restoreToken string, showCursor bool
 		return 0, nil, nil, "", fmt.Errorf("session handle: %w", err)
 	}
 
-	// cursor_mode: HIDDEN=1, EMBEDDED=2 (cursor baked into the stream)
-	cursorMode := uint32(1)
-	if showCursor {
-		cursorMode = 2
-	}
-
-	// Select sources (screen)
-	selectOpts := map[string]dbus.Variant{
-		"handle_token": dbus.MakeVariant(baseToken + "_select"),
-		"types":        dbus.MakeVariant(uint32(1)), // MONITOR=1, WINDOW=2
-		"multiple":     dbus.MakeVariant(false),
-		"cursor_mode":  dbus.MakeVariant(cursorMode),
-	}
-	if portalVersion >= 4 {
-		selectOpts["persist_mode"] = dbus.MakeVariant(uint32(2))
-		if restoreToken != "" {
-			selectOpts["restore_token"] = dbus.MakeVariant(restoreToken)
-			dbg("[CAPTURE] requesting screencast restore with saved token")
-		}
-	}
+	selectOpts := screencastSourceOptions(baseToken, showCursor, portalVersion)
 
 	requestHandle = ""
 	call = portal.Call("org.freedesktop.portal.ScreenCast.SelectSources", 0,

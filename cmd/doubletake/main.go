@@ -80,7 +80,22 @@ func main() {
 	x11WindowID := flag.String("x11-window-id", "", "X11 window id to capture, decimal or 0xhex")
 	x11WindowName := flag.String("x11-window-name", "", "X11 window name to capture; prefer -x11-window-id")
 	noCursor := flag.Bool("no-cursor", false, "Don't show the mouse cursor in the captured video")
+	extend := flag.Bool("extend", false, "Extend the desktop using an automatically selected temporary Hyprland monitor")
+	extendSize := flag.String("extend-size", "1920x1080", "Extended desktop size: WIDTHxHEIGHT")
 	flag.Parse()
+	extendCanvas := ""
+	if *extend {
+		extendCanvas = *extendSize
+		if extendCanvas == "" {
+			log.Fatal("-extend-size must not be empty")
+		}
+		if _, _, err := airplay.ParseExtendSize(extendCanvas); err != nil {
+			log.Fatal(err)
+		}
+		if *testMode || *x11WindowID != "" || *x11WindowName != "" {
+			log.Fatal("-extend cannot be combined with -test or X11 window capture")
+		}
+	}
 	if err := airplay.ValidateHWAccel(*hwaccel); err != nil {
 		log.Fatalf("invalid -hwaccel: %v", err)
 	}
@@ -104,6 +119,7 @@ func main() {
 
 	if *daemonize {
 		runDaemon(daemon.Config{
+			ExtendSize:  extendCanvas,
 			SocketPath:  *socketPath,
 			CredFile:    *credFile,
 			CredBackend: *credBackend,
@@ -339,6 +355,7 @@ func main() {
 	// information. Some current receivers omit displays before that session
 	// exists; committing the pipeline earlier silently selects the 720p fallback.
 	captureCfg := airplay.CaptureConfig{
+		ExtendSize:    extendCanvas,
 		FPS:           *fps,
 		Bitrate:       *bitrate,
 		HWAccel:       *hwaccel,
@@ -369,119 +386,130 @@ func main() {
 	if err != nil {
 		log.Fatalf("prepare screen capture: %v", err)
 	}
-	streamCfg.AutomaticHEVCAvailable = capturePreparation.AutomaticHEVCAvailable()
-	streamCfg.MeasuredVideoLatency = capturePreparation.MeasuredVideoLatency()
+	streamErr := func() error {
+		streamCfg.AutomaticHEVCAvailable = capturePreparation.AutomaticHEVCAvailable()
+		streamCfg.MeasuredVideoLatency = capturePreparation.MeasuredVideoLatency()
 
-	var capture *airplay.ScreenCapture
-	var broadcast *airplay.BroadcastCapture
-	var broadcastDone chan error
-	startedWidth, startedHeight := -1, -1
-	startedCodec := airplay.VideoCodec("")
-	var liveVideoLead time.Duration
-	prepareVideo := func(width, height int, codec airplay.VideoCodec) (airplay.VideoPreparationResult, error) {
-		if capture != nil {
-			if codec == startedCodec {
-				if width != startedWidth || height != startedHeight {
-					log.Printf("receiver updated the %s canvas to %dx%d after capture started; keeping %dx%d for this session", codec, width, height, startedWidth, startedHeight)
+		var capture *airplay.ScreenCapture
+		var broadcast *airplay.BroadcastCapture
+		var broadcastDone chan error
+		startedWidth, startedHeight := -1, -1
+		startedCodec := airplay.VideoCodec("")
+		var liveVideoLead time.Duration
+		prepareVideo := func(width, height int, codec airplay.VideoCodec) (airplay.VideoPreparationResult, error) {
+			if capture != nil {
+				if codec == startedCodec {
+					if width != startedWidth || height != startedHeight {
+						log.Printf("receiver updated the %s canvas to %dx%d after capture started; keeping %dx%d for this session", codec, width, height, startedWidth, startedHeight)
+					}
+					return airplay.VideoPreparationResult{MinimumVideoLead: liveVideoLead}, nil
 				}
-				return airplay.VideoPreparationResult{MinimumVideoLead: liveVideoLead}, nil
+				return airplay.VideoPreparationResult{}, fmt.Errorf("receiver changed video from %s %dx%d to %s %dx%d during setup", startedCodec, startedWidth, startedHeight, codec, width, height)
 			}
-			return airplay.VideoPreparationResult{}, fmt.Errorf("receiver changed video from %s %dx%d to %s %dx%d during setup", startedCodec, startedWidth, startedHeight, codec, width, height)
-		}
-		startedCapture, startErr := capturePreparation.StartWithCodec(width, height, codec)
-		if startErr != nil {
-			return airplay.VideoPreparationResult{}, startErr
-		}
-		if codec == airplay.VideoCodecHEVC && !airplay.HasExplicitTargetLatency() {
-			liveVideoLead, startErr = airplay.MeasureVideoCaptureLatency(ctx, startedCapture, *fps)
+			startedCapture, startErr := capturePreparation.StartWithCodec(width, height, codec)
 			if startErr != nil {
-				startedCapture.Stop()
-				return airplay.VideoPreparationResult{}, fmt.Errorf("measure production HEVC timing: %w", startErr)
+				return airplay.VideoPreparationResult{}, startErr
 			}
-			log.Printf("[CAPTURE] production HEVC timing requires at least %v video lead", liveVideoLead)
-		}
-		activeBroadcast := airplay.NewBroadcastCaptureWithFrameRate(startedCapture, *fps)
-		done := make(chan error, 1)
-		capture = startedCapture
-		broadcast = activeBroadcast
-		broadcastDone = done
-		startedWidth, startedHeight = width, height
-		startedCodec = codec
-		go func(active *airplay.BroadcastCapture, result chan<- error) {
-			result <- active.Run()
-		}(activeBroadcast, done)
-		log.Printf("screen capture started at %dx%d using %s", width, height, codec)
-		return airplay.VideoPreparationResult{MinimumVideoLead: liveVideoLead}, nil
-	}
-	defer func() {
-		capturePreparation.Close()
-		if capture != nil {
-			capture.Stop()
-			<-broadcastDone
-		}
-	}()
-
-	session, err := client.SetupMirrorWithCalibratedVideoPreparation(ctx, streamCfg, prepareVideo)
-	if errors.Is(err, airplay.ErrCredentialsRequired) {
-		// Some legacy receivers do not advertise their configured password in
-		// /info. They reveal it only by challenging the first media SETUP. Keep
-		// the completed pairing/FairPlay state and running capture, configure the
-		// cached Digest challenge, and retry this setup exactly once.
-		credential = readCredential(bufio.NewReader(os.Stdin), "Enter the code shown on the receiver, or its configured password: ")
-		if credential == "" {
-			log.Fatal("receiver code/password cannot be empty")
-		}
-		client.SetPassword(credential)
-		if startedCodec != "" {
-			// A late Digest challenge may expose richer authenticated display
-			// metadata on the retry. The running encoder is single-use, so pin
-			// the already safe concrete codec for the remainder of this session.
-			streamCfg.VideoCodec = startedCodec
-		}
-		session, err = client.SetupMirrorWithCalibratedVideoPreparation(ctx, streamCfg, prepareVideo)
-	}
-	if err != nil {
-		log.Fatalf("mirror setup failed: %v", err)
-	}
-	if capture == nil || broadcast == nil {
-		log.Fatal("mirror setup completed without preparing video capture")
-	}
-	defer session.Close()
-	log.Printf("mirror session ready (data port: %d)", session.DataPort)
-
-	go func() {
-		<-ctx.Done()
-		capture.Stop()
-		session.Close()
-	}()
-
-	// Start audio capture and streaming unless disabled.
-	if !*noAudio && session.HasAudio() {
-		audioCapture, err := airplay.StartAudioCapture(ctx, *testMode, session.AudioCodec())
-		if err != nil {
-			log.Printf("warning: audio capture failed: %v (continuing without audio)", err)
-		} else {
-			defer audioCapture.Stop()
-			go func() {
-				if err := session.StreamAudio(ctx, audioCapture, session.AudioStream()); err != nil && ctx.Err() == nil {
-					log.Printf("audio streaming error: %v", err)
+			if codec == airplay.VideoCodecHEVC && !airplay.HasExplicitTargetLatency() {
+				liveVideoLead, startErr = airplay.MeasureVideoCaptureLatency(ctx, startedCapture, *fps)
+				if startErr != nil {
+					startedCapture.Stop()
+					return airplay.VideoPreparationResult{}, fmt.Errorf("measure production HEVC timing: %w", startErr)
 				}
-			}()
-			log.Println("audio capture started")
+				log.Printf("[CAPTURE] production HEVC timing requires at least %v video lead", liveVideoLead)
+			}
+			activeBroadcast := airplay.NewBroadcastCaptureWithFrameRate(startedCapture, *fps)
+			done := make(chan error, 1)
+			capture = startedCapture
+			broadcast = activeBroadcast
+			broadcastDone = done
+			startedWidth, startedHeight = width, height
+			startedCodec = codec
+			go func(active *airplay.BroadcastCapture, result chan<- error) {
+				result <- active.Run()
+			}(activeBroadcast, done)
+			log.Printf("screen capture started at %dx%d using %s", width, height, codec)
+			return airplay.VideoPreparationResult{MinimumVideoLead: liveVideoLead}, nil
 		}
-	} else if !*noAudio {
-		log.Println("audio disabled (receiver did not provide audio ports)")
-	}
+		defer func() {
+			capturePreparation.Close()
+			if capture != nil {
+				capture.Stop()
+				<-broadcastDone
+			}
+		}()
 
-	videoSink, err := broadcast.AddBackpressuredSink()
-	if err != nil {
-		log.Fatalf("attach single-target video capture: %v", err)
+		session, err := client.SetupMirrorWithCalibratedVideoPreparation(ctx, streamCfg, prepareVideo)
+		if errors.Is(err, airplay.ErrCredentialsRequired) {
+			// Some legacy receivers do not advertise their configured password in
+			// /info. They reveal it only by challenging the first media SETUP. Keep
+			// the completed pairing/FairPlay state and running capture, configure the
+			// cached Digest challenge, and retry this setup exactly once.
+			fmt.Print("Enter the code shown on the receiver, or its configured password: ")
+			line, readErr := bufio.NewReader(os.Stdin).ReadString('\n')
+			if readErr != nil {
+				return fmt.Errorf("read receiver credential: %w", readErr)
+			}
+			credential = strings.TrimSpace(line)
+			if credential == "" {
+				return fmt.Errorf("receiver code/password cannot be empty")
+			}
+			client.SetPassword(credential)
+			if startedCodec != "" {
+				// A late Digest challenge may expose richer authenticated display
+				// metadata on the retry. The running encoder is single-use, so pin
+				// the already safe concrete codec for the remainder of this session.
+				streamCfg.VideoCodec = startedCodec
+			}
+			session, err = client.SetupMirrorWithCalibratedVideoPreparation(ctx, streamCfg, prepareVideo)
+		}
+		if err != nil {
+			return fmt.Errorf("mirror setup failed: %w", err)
+		}
+		if capture == nil || broadcast == nil {
+			return fmt.Errorf("mirror setup completed without preparing video capture")
+		}
+		defer session.Close()
+		log.Printf("mirror session ready (data port: %d)", session.DataPort)
+
+		go func() {
+			<-ctx.Done()
+			capture.Stop()
+			session.Close()
+		}()
+
+		// Start audio capture and streaming unless disabled.
+		if !*noAudio && session.HasAudio() {
+			audioCapture, err := airplay.StartAudioCapture(ctx, *testMode, session.AudioCodec())
+			if err != nil {
+				log.Printf("warning: audio capture failed: %v (continuing without audio)", err)
+			} else {
+				defer audioCapture.Stop()
+				go func() {
+					if err := session.StreamAudio(ctx, audioCapture, session.AudioStream()); err != nil && ctx.Err() == nil {
+						log.Printf("audio streaming error: %v", err)
+					}
+				}()
+				log.Println("audio capture started")
+			}
+		} else if !*noAudio {
+			log.Println("audio disabled (receiver did not provide audio ports)")
+		}
+
+		videoSink, err := broadcast.AddBackpressuredSink()
+		if err != nil {
+			return fmt.Errorf("attach single-target video capture: %w", err)
+		}
+		defer videoSink.Close()
+		if err := session.StreamFrames(ctx, videoSink.AsCapture(), 0*time.Second); err != nil && ctx.Err() == nil {
+			return fmt.Errorf("streaming error: %w", err)
+		}
+		log.Println("stream ended")
+		return nil
+	}()
+	if streamErr != nil {
+		log.Fatal(streamErr)
 	}
-	defer videoSink.Close()
-	if err := session.StreamFrames(ctx, videoSink.AsCapture(), 0*time.Second); err != nil && ctx.Err() == nil {
-		log.Fatalf("streaming error: %v", err)
-	}
-	log.Println("stream ended")
 }
 
 // credentialOrPrompt returns a supplied credential or makes one pairing-display

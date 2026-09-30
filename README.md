@@ -28,6 +28,7 @@ before rebuilding to reproduce the same source version.
 - FairPlay SAP authentication (clean Go implementation)
 - SRP-6a pairing with PIN and persistent credential storage
 - Wayland (PipeWire/xdg-desktop-portal) and X11 screen capture
+- Hyprland extend mode with a temporary virtual monitor per receiver
 - H.264 encoding with NVENC, VA-API, OpenH264, and x264
 - Capability-gated HEVC Main10/high-resolution encoding with NVENC or x265
 - ChaCha20-Poly1305 stream encryption
@@ -36,6 +37,102 @@ before rebuilding to reproduce the same source version.
 - In-process test receiver for hardware-free pairing and media-flow tests
 - Automatic AirPlay screen/audio latency policy with an optional `-target-latency-ms` override
 - KDE Plasma widget for quick access (see [plasmoid/](plasmoid/))
+
+## Extend your desktop (Hyprland)
+
+```sh
+./bin/doubletake -extend -target TV_IP
+# Choose another desktop size:
+./bin/doubletake -extend -extend-size 1280x720 -target TV_IP
+```
+
+Doubletake creates a temporary monitor named `doubletake-…`, placed automatically
+beside your existing monitors and selects it automatically using the Hyprland
+portal picker hook. Move windows onto it using your usual Hyprland workspace/window
+controls. Saved mirror selections are ignored and extend selections do not
+overwrite your saved mirror token.
+
+The default desktop is 1920×1080 at scale 1, with the `-fps` refresh rate. It is
+scaled to the receiver's negotiated video canvas. This uses the existing AirPlay
+mirroring transport; the receiver needs no special extend capability. Audio still
+captures the computer's desktop audio, not only applications on the virtual monitor.
+
+Daemon mode supports the same flags:
+
+```sh
+./bin/doubletake -daemonize -extend -extend-size 1920x1080
+./bin/doubletake-ctl connect TV_IP
+```
+
+Each extended receiver gets an independent desktop. A single daemon can mix
+mirror and extend sessions; choose the mode when connecting:
+
+```sh
+./bin/doubletake-ctl -mode extend -extend-size 1280x720 connect TV_IP
+./bin/doubletake-ctl -mode mirror connect OTHER_TV_IP
+```
+
+Socket clients send `mode: "mirror"` or `mode: "extend"` and optional
+`extend_size: "1280x720"` on the initial `connect` request. Omitted mode uses the
+daemon startup default, preserving compatibility with existing clients. Status
+reports `mode` and `extend_size` per stream. Disconnect and reconnect to change
+an existing session's mode; PIN/password submissions retain its original mode.
+
+### Detecting daemon features
+
+`doubletake-ctl status` (socket request `{"cmd":"status"}`) includes:
+
+```json
+"capabilities": {
+  "session_modes": ["mirror", "extend"],
+  "per_session_mode": true,
+  "extend_backends": ["hyprland"]
+}
+```
+
+These fields describe the running daemon's implemented features, regardless of
+idle/active state or reported connection errors. They do not probe the environment:
+Hyprland, its portal, and capture dependencies still need to be available.
+Clients should enable extend only when `session_modes` includes `extend`, and
+check `per_session_mode` before requesting modes on individual connections.
+A missing `capabilities` field means legacy/unknown support; do not infer extend
+support from a package name or from a newer binary installed while an older
+daemon is still running. Clients should ignore unknown fields and mode names.
+
+### Hyprland picker integration
+
+On first use, extend mode installs `hyprland-picker.sh` under
+`$XDG_DATA_HOME/doubletake` (default `~/.local/share/doubletake`) and appends a
+marked block to `~/.config/hypr/xdph.conf` (or `$XDG_CONFIG_HOME/hypr/xdph.conf`).
+The existing picker remains the fallback, including custom preview pickers.
+The original configuration is backed up as `xdph.conf.doubletake-backup`.
+
+That first installation restarts `xdg-desktop-portal-hyprland`, which interrupts
+other active screen shares. Subsequent connections leave the portal running.
+The wrapper remains installed after disconnect and uses the normal picker unless
+it consumes a one-shot extend marker. Markers expire after 30 seconds, require a
+live sender, and are removed after the portal request, including failed requests.
+Doubletake serializes its portal acquisitions across processes.
+
+**Limitation:** Hyprland does not supply requester identity to custom pickers.
+Another application's simultaneous share request can consume the extend marker
+and receive the virtual display. Avoid starting other screen shares during extend
+connection startup. Ordinary sharing after startup uses the normal picker.
+Finish any active Waycast session before first installing this integration.
+
+To uninstall the integration, stop sharing, remove only the block between
+`# BEGIN doubletake extend picker` and `# END doubletake extend picker` from
+`xdph.conf`, restart `xdg-desktop-portal-hyprland`, and remove the wrapper script.
+Preserve other edits rather than restoring an old backup over the current file.
+
+Requirements: a running Hyprland session, `hyprctl`, and a working Wayland sharing
+portal/PipeWire setup. Other compositors and X11 extend are not implemented.
+`-extend` cannot be combined with `-test` or X11 window capture.
+
+The monitor is removed on normal disconnect, cancellation, and handled setup errors;
+the virtual monitor is not saved in your monitor configuration. After a forced kill or process crash,
+a monitor may remain. Identify it with `hyprctl monitors all`, then remove only its
+exact name with `hyprctl output remove doubletake-NAME`.
 
 ## Requirements
 
@@ -71,6 +168,19 @@ mode selection:
 - [`doubletake-alchemy-bin`](https://aur.archlinux.org/packages/doubletake-alchemy-bin) — installs prebuilt binaries from the fork's GitHub release.
 
 Choose one package. Both provide the `doubletake` and `doubletake-ctl` commands.
+
+### Receiver discovery
+
+The daemon publishes receivers as soon as they resolve. When Avahi is running,
+it uses Avahi's D-Bus service and shared mDNS cache; otherwise it falls back to
+native mDNS without requiring an additional daemon. On Arch Linux, the optional
+`avahi` package supplies this service (`avahi-daemon.service`).
+
+`doubletake-ctl discover` returns the current cache immediately and requests a
+background refresh. Repeated requests are coalesced, with at most one browse
+restart every five seconds. `doubletake-ctl devices` reads the cache without
+requesting a refresh. Discovery continues in the background, processes service
+removals, and expires receivers not observed for thirty seconds.
 
 ### Receiver timing compatibility
 
@@ -443,7 +553,7 @@ doubletake-ctl unmute [target]
 
 - `disconnect` without a target stops all active streams.
 - `disconnect <target>` stops only that receiver.
-- `mute`/`unmute` can operate globally or per target.
+- `mute`/`unmute` can operate globally or per target. They silence/resume outgoing audio without changing the TV volume. Audio already buffered by the receiver may finish playing before mute takes effect.
 - `pin` retains its historical command name, but submits whichever credential
   the daemon requests: an on-screen PIN or a configured password. It is
   targetless and therefore requires exactly one waiting receiver; use
@@ -473,3 +583,18 @@ Since I assume most of the code for this project was trained from [UxPlay](https
 This project is licensed under the [GNU Lesser General Public License v3.0 or later](LICENSE) (`LGPL-3.0-or-later`). See the LICENSE file for the LGPL terms and [COPYING.GPL](COPYING.GPL) for the incorporated GPLv3 terms.
 
 Releases v0.3.2 and earlier were provided under the GNU General Public License v3.0 or later (`GPL-3.0-or-later`).
+
+## Prebuilt fork releases
+
+Fork releases from `v0.4.0-alchemy.2` publish
+`doubletake-VERSION-linux-amd64.tar.gz` and
+`doubletake-VERSION-linux-arm64.tar.gz`, each with a `.sha256` checksum file.
+Each archive contains the three executables, manpages, documentation, licenses,
+and VERSION/REVISION files. Go is not needed to run them; GStreamer and the
+runtime requirements above are still required. The binaries use the default
+ALAC audio build, without optional FDK AAC-ELD. Arm64 is cross-compiled; this
+does not establish hardware capture compatibility on every arm64 system.
+
+For maintainers, `bash scripts/build-release.sh VERSION ARCH [OUTPUT_DIR]`
+builds the same archive layout locally. Tag-triggered CI tests the source,
+builds both architectures, and publishes the archives and checksums.

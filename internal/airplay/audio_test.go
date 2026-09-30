@@ -191,6 +191,7 @@ func TestStreamAudioAnchorsClockOnlyAfterFirstCapturedFrame(t *testing.T) {
 		chachaNonceMode: defaultAudioChaChaNonceMode(),
 		chachaAADMode:   defaultAudioChaChaAADMode(),
 	}
+	session.audioStream = stream
 	pcmReader := newGatedPCMReader()
 	capture := &AudioCapture{
 		pcmPipe: pcmReader,
@@ -210,7 +211,7 @@ func TestStreamAudioAnchorsClockOnlyAfterFirstCapturedFrame(t *testing.T) {
 		}
 	}
 	const pcmFrameBytes = 352 * 2 * 2
-	pcmFrame := make([]byte, pcmFrameBytes)
+	pcmFrame := bytes.Repeat([]byte{0x12, 0x34}, pcmFrameBytes/2)
 	waitForPCMRead("pre-roll")
 
 	// Starting the process and observing the first video frame are not enough to
@@ -266,8 +267,43 @@ func TestStreamAudioAnchorsClockOnlyAfterFirstCapturedFrame(t *testing.T) {
 	if err := dataPeer.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := dataPeer.ReadFrom(buf); err != nil {
+	n, _, err = dataPeer.ReadFrom(buf)
+	if err != nil {
 		t.Fatalf("read first RTP audio packet: %v", err)
+	}
+	expected := make([]byte, 8192)
+	expectedSize := encodeALACVerbatim(expected, pcmFrame, 352, 2, 16)
+	if !bytes.Equal(buf[12:n], expected[:expectedSize]) {
+		t.Fatal("initial frame is not captured audio")
+	}
+	previousRTP := binary.BigEndian.Uint32(buf[4:8])
+	previousSeq := binary.BigEndian.Uint16(buf[2:4])
+	for _, muted := range []bool{true, false, true, false} {
+		waitForPCMRead("mute transition")
+		// Toggle while the read is blocked: the state must be checked after capture.
+		if err := session.SetAudioMuted(muted); err != nil {
+			t.Fatal(err)
+		}
+		pcmReader.frames <- pcmFrame
+		_ = dataPeer.SetReadDeadline(time.Now().Add(time.Second))
+		n, _, err = dataPeer.ReadFrom(buf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantPCM := pcmFrame
+		if muted {
+			wantPCM = make([]byte, pcmFrameBytes)
+		}
+		expectedSize = encodeALACVerbatim(expected, wantPCM, 352, 2, 16)
+		if !bytes.Equal(buf[12:n], expected[:expectedSize]) {
+			t.Fatalf("muted=%t: unexpected encoded audio", muted)
+		}
+		rtp := binary.BigEndian.Uint32(buf[4:8])
+		seq := binary.BigEndian.Uint16(buf[2:4])
+		if rtp != previousRTP+352 || seq != previousSeq+1 {
+			t.Fatal("mute interrupted RTP timeline")
+		}
+		previousRTP, previousSeq = rtp, seq
 	}
 
 	cancel()
@@ -693,6 +729,25 @@ func TestAudioSendBurstLimiterOnlyDelaysCatchupBurst(t *testing.T) {
 		now := base.Add(time.Duration(frame) * 8 * time.Millisecond)
 		if delay := limiter.reserveDelay(now); delay != 0 {
 			t.Fatalf("normally paced frame %d delay = %v, want 0", frame, delay)
+		}
+	}
+}
+
+func TestSetAudioMutedIsLocalAndPerSession(t *testing.T) {
+	// No RTSP connection exists: mute must not attempt any receiver command.
+	first := &MirrorSession{audioStream: &AudioStream{}}
+	second := &MirrorSession{audioStream: &AudioStream{}}
+	for _, muted := range []bool{true, true, false, false} {
+		if err := first.SetAudioMuted(muted); err != nil {
+			t.Fatal(err)
+		}
+		if first.audioMuted.Load() != muted || second.audioMuted.Load() {
+			t.Fatal("incorrect per-session mute state")
+		}
+	}
+	for _, session := range []*MirrorSession{nil, {}, {noAudio: true, audioStream: &AudioStream{}}} {
+		if err := session.SetAudioMuted(true); err == nil {
+			t.Fatal("expected error without active audio")
 		}
 	}
 }

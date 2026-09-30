@@ -41,14 +41,18 @@ const (
 
 // Request is a command sent to the daemon over the control socket.
 type Request struct {
-	Cmd    string `json:"cmd"`
-	Target string `json:"target,omitempty"`
-	Port   int    `json:"port,omitempty"`
-	Pin    string `json:"pin,omitempty"`
+	Mode       string `json:"mode,omitempty"`
+	ExtendSize string `json:"extend_size,omitempty"`
+	Cmd        string `json:"cmd"`
+	Target     string `json:"target,omitempty"`
+	Port       int    `json:"port,omitempty"`
+	Pin        string `json:"pin,omitempty"`
 }
 
 // StreamInfo describes one active (or connecting) mirror stream.
 type StreamInfo struct {
+	Mode           string         `json:"mode"`
+	ExtendSize     string         `json:"extend_size,omitempty"`
 	Device         string         `json:"device"`
 	DeviceIP       string         `json:"device_ip"`
 	State          State          `json:"state"`
@@ -57,14 +61,31 @@ type StreamInfo struct {
 	CredentialKind CredentialKind `json:"credential_kind,omitempty"`
 }
 
+// Capabilities describes implemented features, not environment readiness.
+// Older daemons omit this field; clients must treat absence as unknown support.
+type Capabilities struct {
+	SessionModes   []string `json:"session_modes"`
+	PerSessionMode bool     `json:"per_session_mode"`
+	ExtendBackends []string `json:"extend_backends"`
+}
+
+func implementedCapabilities() *Capabilities {
+	return &Capabilities{
+		SessionModes:   []string{"mirror", "extend"},
+		PerSessionMode: true,
+		ExtendBackends: []string{"hyprland"},
+	}
+}
+
 // Response is returned to the caller for every request.
 type Response struct {
-	OK         bool   `json:"ok"`
-	State      State  `json:"state"`
-	Device     string `json:"device,omitempty"`
-	DeviceIP   string `json:"device_ip,omitempty"`
-	HasAudio   bool   `json:"has_audio"`
-	AudioMuted bool   `json:"audio_muted"`
+	Capabilities *Capabilities `json:"capabilities,omitempty"`
+	OK           bool          `json:"ok"`
+	State        State         `json:"state"`
+	Device       string        `json:"device,omitempty"`
+	DeviceIP     string        `json:"device_ip,omitempty"`
+	HasAudio     bool          `json:"has_audio"`
+	AudioMuted   bool          `json:"audio_muted"`
 	// NeedsPIN is retained for older clients and is true only for an on-screen
 	// PIN. NeedsCredential and CredentialKind distinguish configured passwords.
 	NeedsPIN        bool           `json:"needs_pin,omitempty"`
@@ -86,6 +107,8 @@ type DeviceInfo struct {
 
 // Config holds daemon configuration.
 type Config struct {
+	ExtendSize string
+
 	SocketPath  string
 	CredFile    string
 	CredBackend string
@@ -201,6 +224,8 @@ func removeStaleSocket(socketPath string) error {
 
 // activeStream tracks the state of a single mirroring session to one receiver.
 type activeStream struct {
+	mode           string
+	extendSize     string
 	device         string // friendly name
 	deviceIP       string
 	deviceID       string
@@ -217,8 +242,10 @@ type activeStream struct {
 
 // videoCaptureKey identifies captures which can safely share one encoded
 // stream. Capture settings are daemon-wide, so only the receiver's nominal
-// canvas and codec vary between concurrent targets.
+// canvas and codec vary between mirror targets. Extend adds a receiver identity.
 type videoCaptureKey struct {
+	source string // receiver identity for independent extended desktops
+
 	maxWidth  int
 	maxHeight int
 	codec     airplay.VideoCodec
@@ -316,14 +343,21 @@ type Daemon struct {
 	lastError       string                                 // most recent asynchronous stream failure
 	lastErrorTarget string                                 // target associated with lastError; empty for capture-wide errors
 
-	discoverCancel context.CancelFunc
-	listener       net.Listener
-	streamWorkers  sync.WaitGroup // stream, capture, and externally detached cleanup workers
-	shuttingDown   bool
+	discoverRefresh chan struct{}
+	discoverCancel  context.CancelFunc
+	listener        net.Listener
+	streamWorkers   sync.WaitGroup // stream, capture, and externally detached cleanup workers
+	shuttingDown    bool
 }
 
 // New creates a new Daemon with the given configuration.
 func New(cfg Config) (*Daemon, error) {
+	if _, _, err := airplay.ParseExtendSize(cfg.ExtendSize); err != nil {
+		return nil, err
+	}
+	if cfg.ExtendSize != "" && cfg.TestMode {
+		return nil, fmt.Errorf("extend mode cannot use synthetic capture")
+	}
 	if err := airplay.ValidateHWAccel(cfg.HWAccel); err != nil {
 		return nil, fmt.Errorf("hwaccel: %w", err)
 	}
@@ -360,11 +394,12 @@ func New(cfg Config) (*Daemon, error) {
 	}
 
 	return &Daemon{
-		cfg:            cfg,
-		deviceLastSeen: make(map[string]time.Time),
-		streams:        make(map[string]*activeStream),
-		captureGroups:  make(map[videoCaptureKey]*videoCaptureGroup),
-		credStore:      cs,
+		cfg:             cfg,
+		deviceLastSeen:  make(map[string]time.Time),
+		discoverRefresh: make(chan struct{}, 1),
+		streams:         make(map[string]*activeStream),
+		captureGroups:   make(map[videoCaptureKey]*videoCaptureGroup),
+		credStore:       cs,
 	}, nil
 }
 
@@ -406,10 +441,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 	d.listener = ln
 	d.discoverCancel = discoverCancel
+	d.streamWorkers.Add(1)
 	d.mu.Unlock()
 
 	log.Printf("[daemon] listening on %s", d.cfg.SocketPath)
-	go d.backgroundDiscover(discoverCtx)
+	go func() {
+		defer d.streamWorkers.Done()
+		d.backgroundDiscover(discoverCtx)
+	}()
 
 	go func() {
 		<-ctx.Done()
@@ -461,62 +500,113 @@ func (d *Daemon) Shutdown() {
 	os.Remove(d.cfg.SocketPath)
 }
 
-// backgroundDiscover continuously browses mDNS for AirPlay devices.
-// Each scan runs for 5 seconds. Devices not seen for >30 seconds are removed.
+// Discovery publishes each resolved receiver immediately. Epochs refresh Avahi's
+// cached metadata and retry unavailable backends; native browsing retries within
+// an epoch. User refreshes coalesce and cannot restart a browse more than once
+// every five seconds, even when the plugin polls twice per second.
 func (d *Daemon) backgroundDiscover(ctx context.Context) {
-	const (
-		scanDuration = 5 * time.Second
-		deviceTTL    = 30 * time.Second
-	)
 	log.Printf("[daemon] starting continuous mDNS discovery")
-	for {
-		browseCtx, cancel := context.WithTimeout(ctx, scanDuration)
-		found, err := airplay.DiscoverAirPlayDevices(browseCtx)
-		cancel()
-
-		if ctx.Err() != nil {
-			return
-		}
-
-		now := time.Now()
-		d.mu.Lock()
-		if err == nil {
-			// Build a map of currently known devices by IP for quick lookup
-			known := make(map[string]airplay.AirPlayDevice, len(d.devices))
-			for _, dev := range d.devices {
-				known[dev.IP] = dev
-			}
-
-			// Update last-seen timestamps and merge new devices
-			for _, dev := range found {
-				d.deviceLastSeen[dev.IP] = now
-				known[dev.IP] = dev // add or update
-			}
-
-			// Rebuild device list, dropping anything older than TTL
-			devices := make([]airplay.AirPlayDevice, 0, len(known))
-			for ip, dev := range known {
-				if now.Sub(d.deviceLastSeen[ip]) <= deviceTTL {
-					devices = append(devices, dev)
-				} else {
-					delete(d.deviceLastSeen, ip)
+	for ctx.Err() == nil {
+		d.expireDiscoveredDevices(time.Now())
+		scan, cancel := context.WithCancel(ctx)
+		done := make(chan error, 1)
+		go func() {
+			done <- airplay.BrowseAirPlayDevices(scan, func(event airplay.DiscoveryEvent) {
+				if scan.Err() == nil {
+					d.updateDiscoveredDevice(event, time.Now())
+				}
+			})
+		}()
+		epoch := time.NewTimer(10 * time.Second)
+		cooldown := time.NewTimer(5 * time.Second)
+		expiry := time.NewTicker(time.Second)
+		pending, refreshReady := false, false
+		running := true
+		var browseErr error
+		finished := false
+		for running {
+			select {
+			case <-ctx.Done():
+				running = false
+			case browseErr = <-done:
+				finished = true
+				running = false
+			case <-epoch.C:
+				running = false
+			case <-expiry.C:
+				d.expireDiscoveredDevices(time.Now())
+			case <-d.discoverRefresh:
+				pending = true
+				if refreshReady {
+					running = false
+				}
+			case <-cooldown.C:
+				refreshReady = true
+				if pending {
+					running = false
 				}
 			}
-			d.devices = devices
-			sort.Slice(d.devices, func(i, j int) bool {
-				return d.devices[i].IP < d.devices[j].IP
-			})
 		}
-		d.mu.Unlock()
-		if err != nil {
-			log.Printf("[daemon] mDNS browse error: %v", err)
+		epoch.Stop()
+		cooldown.Stop()
+		expiry.Stop()
+		cancel()
+		if !finished {
+			browseErr = <-done
 		}
+		if browseErr != nil && ctx.Err() == nil {
+			log.Printf("[daemon] mDNS browse error: %v", browseErr)
+			// Avoid a busy retry loop if interfaces or both backends fail.
+			timer := time.NewTimer(time.Second)
+			select {
+			case <-ctx.Done():
+			case <-timer.C:
+			}
+			timer.Stop()
+		}
+	}
+}
 
-		// Next scan starts immediately (no extra wait — the 5s scan is the cadence)
-		if ctx.Err() != nil {
+func (d *Daemon) updateDiscoveredDevice(event airplay.DiscoveryEvent, now time.Time) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	ip := event.Device.IP
+	if event.Removed {
+		delete(d.deviceLastSeen, ip)
+		for i, dev := range d.devices {
+			if dev.IP == ip {
+				d.devices = append(d.devices[:i], d.devices[i+1:]...)
+				break
+			}
+		}
+		return
+	}
+	if d.deviceLastSeen == nil {
+		d.deviceLastSeen = make(map[string]time.Time)
+	}
+	d.deviceLastSeen[ip] = now
+	for i, dev := range d.devices {
+		if dev.IP == ip {
+			d.devices[i] = event.Device
 			return
 		}
 	}
+	d.devices = append(d.devices, event.Device)
+	sort.Slice(d.devices, func(i, j int) bool { return d.devices[i].IP < d.devices[j].IP })
+}
+
+func (d *Daemon) expireDiscoveredDevices(now time.Time) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	kept := d.devices[:0]
+	for _, dev := range d.devices {
+		if now.Sub(d.deviceLastSeen[dev.IP]) <= 30*time.Second {
+			kept = append(kept, dev)
+		} else {
+			delete(d.deviceLastSeen, dev.IP)
+		}
+	}
+	d.devices = kept
 }
 
 func (d *Daemon) handleConn(conn net.Conn) {
@@ -594,6 +684,8 @@ func (d *Daemon) statusResponseLocked(ok bool, errMsg string) Response {
 	streams := make([]StreamInfo, 0, len(d.streams))
 	for _, s := range d.streams {
 		streams = append(streams, StreamInfo{
+			Mode:           s.mode,
+			ExtendSize:     s.extendSize,
 			Device:         s.device,
 			DeviceIP:       s.deviceIP,
 			State:          s.state,
@@ -636,6 +728,7 @@ func (d *Daemon) statusResponseLocked(ok bool, errMsg string) Response {
 	}
 
 	return Response{
+		Capabilities:    implementedCapabilities(),
 		OK:              ok,
 		State:           overall,
 		Device:          device,
@@ -678,6 +771,10 @@ func restoreSavedPairing(client *airplay.AirPlayClient, saved *airplay.SavedCred
 }
 
 func (d *Daemon) handleDiscover() Response {
+	select {
+	case d.discoverRefresh <- struct{}{}:
+	default:
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return Response{
@@ -778,10 +875,22 @@ func (d *Daemon) handleConnect(req Request) Response {
 		port = 7000
 	}
 
+	mode, extendSize, err := resolveSessionMode(req.Mode, req.ExtendSize, d.cfg.ExtendSize)
+	if err != nil || (mode == "extend" && d.cfg.TestMode) {
+		if err == nil {
+			err = fmt.Errorf("extend mode cannot use synthetic capture")
+		}
+		state := d.overallStateLocked()
+		d.mu.Unlock()
+		return Response{OK: false, State: state, Error: err.Error()}
+	}
+
 	// Create the context before publishing the entry so a concurrent disconnect
 	// can always cancel the connection goroutine.
 	connCtx, cancel := context.WithCancel(context.Background())
 	entry := &activeStream{
+		mode:         mode,
+		extendSize:   extendSize,
 		deviceIP:     target,
 		state:        StateConnecting,
 		cancelFn:     cancel,
@@ -1115,7 +1224,7 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 	// not start an encoder until control SETUP exposes session-time display info.
 	// This preserves the receiver deadline while avoiding the provisional 720p
 	// fallback used by receivers whose public /info omits displays.
-	capturePreparation, err := d.prepareVideoCapture(ctx, screenCastRestoreToken, deviceID)
+	capturePreparation, err := d.prepareVideoCapture(ctx, screenCastRestoreToken, deviceID, d.streamExtendSize(entry))
 	if err != nil {
 		removeStream(fmt.Sprintf("prepare capture failed: %v", err))
 		return
@@ -1127,7 +1236,7 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 	var broadcast *airplay.BroadcastCapture
 	selectedCaptureKey := videoCaptureKey{maxWidth: -1, maxHeight: -1}
 	prepareVideo := func(width, height int, codec airplay.VideoCodec) (airplay.VideoPreparationResult, error) {
-		key := normalizedVideoCaptureKey(width, height, codec)
+		key := d.videoCaptureKey(entry, width, height, codec)
 		if broadcast != nil {
 			if key.codec == selectedCaptureKey.codec {
 				if key.maxWidth != selectedCaptureKey.maxWidth || key.maxHeight != selectedCaptureKey.maxHeight {
@@ -1196,7 +1305,13 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 	}
 	// Attach only after SETUP succeeds. This avoids buffering encoded data for a
 	// receiver which is still pairing, prompting, or negotiating its media ports.
-	sink := broadcast.AddSink()
+	sink, err := d.addCaptureSink(entry, broadcast)
+	if err != nil {
+		d.mu.Unlock()
+		_ = session.Close()
+		removeStream(fmt.Sprintf("attach capture sink: %v", err))
+		return
+	}
 	current.state = StateStreaming
 	current.session = session
 	current.client = client
@@ -1286,6 +1401,62 @@ func retryMirrorSetupAfterDigestChallenge(
 // normalizedVideoCaptureKey matches the even canvas which the capture pipeline
 // will actually encode. Invalid or incomplete dimensions share the unconstrained
 // group instead of accidentally constraining one axis only.
+// Empty request mode preserves the daemon's configured default for old clients.
+func resolveSessionMode(mode, size, defaultSize string) (string, string, error) {
+	if mode == "" {
+		mode = "mirror"
+		if defaultSize != "" {
+			mode = "extend"
+		}
+	}
+	switch mode {
+	case "mirror":
+		if size != "" {
+			return "", "", fmt.Errorf("extend_size requires mode extend")
+		}
+		return mode, "", nil
+	case "extend":
+		if size == "" {
+			size = defaultSize
+		}
+		if size == "" {
+			size = "1920x1080"
+		}
+		if _, _, err := airplay.ParseExtendSize(size); err != nil {
+			return "", "", err
+		}
+		return mode, size, nil
+	default:
+		return "", "", fmt.Errorf("mode must be mirror or extend")
+	}
+}
+
+func (d *Daemon) streamExtendSize(entry *activeStream) string {
+	if entry.mode == "" {
+		return d.cfg.ExtendSize
+	}
+	return entry.extendSize
+}
+
+// Extended outputs have a private encoder, so network stalls can propagate to
+// its leaky raw-frame queue instead of disconnecting at the shared relay limit.
+// Mirroring retains independent queues so a slow receiver cannot stall peers.
+func (d *Daemon) addCaptureSink(entry *activeStream, broadcast *airplay.BroadcastCapture) (*airplay.BroadcastSink, error) {
+	if d.streamExtendSize(entry) != "" {
+		return broadcast.AddBackpressuredSink()
+	}
+	return broadcast.AddSink(), nil
+}
+
+// Mirroring can share a capture; extended desktops must remain per receiver.
+func (d *Daemon) videoCaptureKey(entry *activeStream, width, height int, codec airplay.VideoCodec) videoCaptureKey {
+	key := normalizedVideoCaptureKey(width, height, codec)
+	if d.streamExtendSize(entry) != "" {
+		key.source = entry.deviceIP
+	}
+	return key
+}
+
 func normalizedVideoCaptureKey(maxW, maxH int, codecs ...airplay.VideoCodec) videoCaptureKey {
 	codec := airplay.VideoCodecH264
 	if len(codecs) > 0 && codecs[0] != "" {
@@ -1302,11 +1473,12 @@ func normalizedVideoCaptureKey(maxW, maxH int, codecs ...airplay.VideoCodec) vid
 // reveals the session-time display canvas. Portal serialization is deliberately
 // separate from captureStartMu: a different user prompt must not block an
 // already-negotiated receiver from starting its encoder before its deadline.
-func (d *Daemon) prepareVideoCapture(ctx context.Context, restoreToken, deviceID string) (*airplay.CapturePreparation, error) {
+func (d *Daemon) prepareVideoCapture(ctx context.Context, restoreToken, deviceID, extendSize string) (*airplay.CapturePreparation, error) {
 	d.capturePortalMu.Lock()
 	defer d.capturePortalMu.Unlock()
 
 	cfg := airplay.CaptureConfig{
+		ExtendSize:   extendSize,
 		FPS:          d.cfg.FPS,
 		Bitrate:      d.cfg.Bitrate,
 		HWAccel:      d.cfg.HWAccel,
@@ -1333,7 +1505,7 @@ func (d *Daemon) getOrStartPreparedCaptureGroup(ctx context.Context, entry *acti
 	d.captureStartMu.Lock()
 	defer d.captureStartMu.Unlock()
 
-	key := normalizedVideoCaptureKey(width, height, codec)
+	key := d.videoCaptureKey(entry, width, height, codec)
 	d.mu.Lock()
 	if d.streams[entry.deviceIP] != entry {
 		d.mu.Unlock()
@@ -1439,7 +1611,7 @@ func (d *Daemon) getOrStartCaptureGroup(entry *activeStream, restoreToken, devic
 		// a concrete per-session codec to getOrStartPreparedCaptureGroup instead.
 		codec = airplay.VideoCodecH264
 	}
-	key := normalizedVideoCaptureKey(maxW, maxH, codec)
+	key := d.videoCaptureKey(entry, maxW, maxH, codec)
 	d.mu.Lock()
 	if d.streams[entry.deviceIP] != entry {
 		d.mu.Unlock()
@@ -1468,6 +1640,7 @@ func (d *Daemon) getOrStartCaptureGroup(entry *activeStream, restoreToken, devic
 	d.mu.Unlock()
 
 	capCfg := airplay.CaptureConfig{
+		ExtendSize:   d.streamExtendSize(entry),
 		FPS:          d.cfg.FPS,
 		Bitrate:      d.cfg.Bitrate,
 		HWAccel:      d.cfg.HWAccel,
@@ -1708,11 +1881,17 @@ func (d *Daemon) handleSetMute(req Request, muted bool) Response {
 
 	sessions := make([]*airplay.MirrorSession, 0, len(targets))
 	for _, t := range targets {
-		if t.session != nil && (d.cfg.NoAudio || t.session.HasAudio()) {
+		if t.session != nil && !d.cfg.NoAudio && t.session.HasAudio() {
 			sessions = append(sessions, t.session)
 		}
 	}
 	d.mu.Unlock()
+
+	if len(sessions) == 0 {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		return d.statusResponseLocked(false, "no active audio stream")
+	}
 
 	var lastErr error
 	for _, s := range sessions {
@@ -1728,6 +1907,9 @@ func (d *Daemon) handleSetMute(req Request, muted bool) Response {
 
 	d.mu.Lock()
 	for _, t := range targets {
+		if t.session == nil || d.cfg.NoAudio || !t.session.HasAudio() {
+			continue
+		}
 		t.audioMuted = muted
 	}
 	defer d.mu.Unlock()

@@ -281,6 +281,10 @@ func (ac *AudioCapture) ReadFrameAt(buf []byte) (int, time.Time, error) {
 }
 
 func (ac *AudioCapture) readFramePosition(buf []byte) (int, audioPCMFramePosition, error) {
+	return ac.readFramePositionWithMute(buf, nil)
+}
+
+func (ac *AudioCapture) readFramePositionWithMute(buf []byte, muted func() bool) (int, audioPCMFramePosition, error) {
 	select {
 	case <-ac.waitCh:
 		if ac.waitErr != nil {
@@ -309,6 +313,11 @@ func (ac *AudioCapture) readFramePosition(buf []byte) (int, audioPCMFramePositio
 	}
 	if err != nil {
 		return 0, audioPCMFramePosition{}, err
+	}
+	// Consume the real source frame even when muted so unmute resumes live audio.
+	// Zero samples before either codec encodes them; timestamps remain unchanged.
+	if muted != nil && muted() {
+		clear(pcm)
 	}
 	if ac.codec == AudioCodecAACELD {
 		ac.eldMu.Lock()
@@ -1130,7 +1139,7 @@ videoReady:
 	var firstFramePosition audioPCMFramePosition
 	catchupFrames := 0
 	for firstFrameSize == 0 {
-		firstFrameSize, firstFramePosition, err = capture.readFramePosition(frameBuf)
+		firstFrameSize, firstFramePosition, err = capture.readFramePositionWithMute(frameBuf, s.audioMuted.Load)
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
@@ -1280,7 +1289,7 @@ videoReady:
 		if usingFirstFrame {
 			useFirstFrame = false
 		} else {
-			n, framePosition, err = capture.readFramePosition(frameBuf)
+			n, framePosition, err = capture.readFramePositionWithMute(frameBuf, s.audioMuted.Load)
 			if err != nil {
 				if ctx.Err() != nil {
 					return ctx.Err()

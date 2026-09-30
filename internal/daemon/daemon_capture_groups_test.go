@@ -298,3 +298,98 @@ func assertDaemonMutexAvailable(t *testing.T, d *Daemon, release, done chan stru
 		t.Fatal("daemon mutex remained locked during blocking cleanup")
 	}
 }
+
+func TestExtendedDesktopCaptureGroupsArePerReceiver(t *testing.T) {
+	first := &activeStream{deviceIP: "192.0.2.1"}
+	second := &activeStream{deviceIP: "192.0.2.2"}
+	d := &Daemon{}
+	key := func(entry *activeStream) videoCaptureKey {
+		return d.videoCaptureKey(entry, 1920, 1080, airplay.VideoCodecH264)
+	}
+	if key(first) != key(second) {
+		t.Fatal("mirror sessions should share their capture")
+	}
+	d.cfg.ExtendSize = "1920x1080"
+	if key(first) == key(second) {
+		t.Fatal("extended desktops must not share a capture")
+	}
+	sameReceiver := &activeStream{deviceIP: first.deviceIP}
+	if key(first) != key(sameReceiver) {
+		t.Fatal("capture identity must remain stable across setup retry")
+	}
+}
+
+func TestSessionModeDefaultsAndOverrides(t *testing.T) {
+	for _, tt := range []struct {
+		mode, size, defaultSize, wantMode, wantSize string
+		invalid                                     bool
+	}{
+		{wantMode: "mirror"},
+		{defaultSize: "1280x720", wantMode: "extend", wantSize: "1280x720"},
+		{mode: "mirror", defaultSize: "1280x720", wantMode: "mirror"},
+		{mode: "extend", wantMode: "extend", wantSize: "1920x1080"},
+		{mode: "extend", size: "1280x720", wantMode: "extend", wantSize: "1280x720"},
+		{mode: "invalid", invalid: true},
+		{mode: "mirror", size: "1280x720", invalid: true},
+		{mode: "extend", size: "bad", invalid: true},
+	} {
+		mode, size, err := resolveSessionMode(tt.mode, tt.size, tt.defaultSize)
+		if (err != nil) != tt.invalid || mode != tt.wantMode || size != tt.wantSize {
+			t.Fatalf("%+v: got %s/%s, %v", tt, mode, size, err)
+		}
+	}
+}
+
+func TestMixedSessionCaptureIsolation(t *testing.T) {
+	d := &Daemon{cfg: Config{ExtendSize: "1920x1080"}}
+	mirror := &activeStream{deviceIP: "192.0.2.1", mode: "mirror"}
+	extend := &activeStream{deviceIP: "192.0.2.2", mode: "extend", extendSize: "1280x720"}
+	other := &activeStream{deviceIP: "192.0.2.3", mode: "extend", extendSize: "1280x720"}
+	if d.streamExtendSize(mirror) != "" || d.streamExtendSize(extend) != "1280x720" {
+		t.Fatal("per-session modes did not override daemon default")
+	}
+	key := func(e *activeStream) videoCaptureKey { return d.videoCaptureKey(e, 1280, 720, airplay.VideoCodecH264) }
+	if key(mirror) == key(extend) || key(extend) == key(other) {
+		t.Fatal("independent sources share a capture")
+	}
+	d.streams = map[string]*activeStream{mirror.deviceIP: mirror, extend.deviceIP: extend}
+	status := d.handleStatus()
+	if status.Streams[0].Mode != "mirror" || status.Streams[1].Mode != "extend" || status.Streams[1].ExtendSize != "1280x720" {
+		t.Fatalf("wrong modes in status: %+v", status.Streams)
+	}
+}
+
+func TestCaptureSinkPolicyMatchesSessionIsolation(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		defaultSize string
+		entry       activeStream
+		exclusive   bool
+	}{
+		{name: "mirror", entry: activeStream{mode: "mirror"}},
+		{name: "extend", entry: activeStream{mode: "extend", extendSize: "1920x1080"}, exclusive: true},
+		{name: "legacy extend default", defaultSize: "1920x1080", exclusive: true},
+		{name: "mirror overrides extend default", defaultSize: "1920x1080", entry: activeStream{mode: "mirror"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := &Daemon{cfg: Config{ExtendSize: tc.defaultSize}}
+			broadcast := airplay.NewBroadcastCapture(nil)
+			sink, err := d.addCaptureSink(&tc.entry, broadcast)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer sink.Close()
+			sink.Close()
+			// A private capture stays exclusively reserved even after removal.
+			// A shared capture can accept a new owner once all peers leave.
+			probe, probeErr := broadcast.AddBackpressuredSink()
+			if probe != nil {
+				defer probe.Close()
+			}
+			if (probeErr != nil) != tc.exclusive {
+				t.Fatalf("exclusive = %v, registration error = %v", tc.exclusive, probeErr)
+			}
+
+		})
+	}
+}
