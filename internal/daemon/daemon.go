@@ -343,10 +343,11 @@ type Daemon struct {
 	lastError       string                                 // most recent asynchronous stream failure
 	lastErrorTarget string                                 // target associated with lastError; empty for capture-wide errors
 
-	discoverCancel context.CancelFunc
-	listener       net.Listener
-	streamWorkers  sync.WaitGroup // stream, capture, and externally detached cleanup workers
-	shuttingDown   bool
+	discoverRefresh chan struct{}
+	discoverCancel  context.CancelFunc
+	listener        net.Listener
+	streamWorkers   sync.WaitGroup // stream, capture, and externally detached cleanup workers
+	shuttingDown    bool
 }
 
 // New creates a new Daemon with the given configuration.
@@ -393,11 +394,12 @@ func New(cfg Config) (*Daemon, error) {
 	}
 
 	return &Daemon{
-		cfg:            cfg,
-		deviceLastSeen: make(map[string]time.Time),
-		streams:        make(map[string]*activeStream),
-		captureGroups:  make(map[videoCaptureKey]*videoCaptureGroup),
-		credStore:      cs,
+		cfg:             cfg,
+		deviceLastSeen:  make(map[string]time.Time),
+		discoverRefresh: make(chan struct{}, 1),
+		streams:         make(map[string]*activeStream),
+		captureGroups:   make(map[videoCaptureKey]*videoCaptureGroup),
+		credStore:       cs,
 	}, nil
 }
 
@@ -439,10 +441,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 	d.listener = ln
 	d.discoverCancel = discoverCancel
+	d.streamWorkers.Add(1)
 	d.mu.Unlock()
 
 	log.Printf("[daemon] listening on %s", d.cfg.SocketPath)
-	go d.backgroundDiscover(discoverCtx)
+	go func() {
+		defer d.streamWorkers.Done()
+		d.backgroundDiscover(discoverCtx)
+	}()
 
 	go func() {
 		<-ctx.Done()
@@ -494,62 +500,113 @@ func (d *Daemon) Shutdown() {
 	os.Remove(d.cfg.SocketPath)
 }
 
-// backgroundDiscover continuously browses mDNS for AirPlay devices.
-// Each scan runs for 5 seconds. Devices not seen for >30 seconds are removed.
+// Discovery publishes each resolved receiver immediately. Epochs refresh Avahi's
+// cached metadata and retry unavailable backends; native browsing retries within
+// an epoch. User refreshes coalesce and cannot restart a browse more than once
+// every five seconds, even when the plugin polls twice per second.
 func (d *Daemon) backgroundDiscover(ctx context.Context) {
-	const (
-		scanDuration = 5 * time.Second
-		deviceTTL    = 30 * time.Second
-	)
 	log.Printf("[daemon] starting continuous mDNS discovery")
-	for {
-		browseCtx, cancel := context.WithTimeout(ctx, scanDuration)
-		found, err := airplay.DiscoverAirPlayDevices(browseCtx)
-		cancel()
-
-		if ctx.Err() != nil {
-			return
-		}
-
-		now := time.Now()
-		d.mu.Lock()
-		if err == nil {
-			// Build a map of currently known devices by IP for quick lookup
-			known := make(map[string]airplay.AirPlayDevice, len(d.devices))
-			for _, dev := range d.devices {
-				known[dev.IP] = dev
-			}
-
-			// Update last-seen timestamps and merge new devices
-			for _, dev := range found {
-				d.deviceLastSeen[dev.IP] = now
-				known[dev.IP] = dev // add or update
-			}
-
-			// Rebuild device list, dropping anything older than TTL
-			devices := make([]airplay.AirPlayDevice, 0, len(known))
-			for ip, dev := range known {
-				if now.Sub(d.deviceLastSeen[ip]) <= deviceTTL {
-					devices = append(devices, dev)
-				} else {
-					delete(d.deviceLastSeen, ip)
+	for ctx.Err() == nil {
+		d.expireDiscoveredDevices(time.Now())
+		scan, cancel := context.WithCancel(ctx)
+		done := make(chan error, 1)
+		go func() {
+			done <- airplay.BrowseAirPlayDevices(scan, func(event airplay.DiscoveryEvent) {
+				if scan.Err() == nil {
+					d.updateDiscoveredDevice(event, time.Now())
+				}
+			})
+		}()
+		epoch := time.NewTimer(10 * time.Second)
+		cooldown := time.NewTimer(5 * time.Second)
+		expiry := time.NewTicker(time.Second)
+		pending, refreshReady := false, false
+		running := true
+		var browseErr error
+		finished := false
+		for running {
+			select {
+			case <-ctx.Done():
+				running = false
+			case browseErr = <-done:
+				finished = true
+				running = false
+			case <-epoch.C:
+				running = false
+			case <-expiry.C:
+				d.expireDiscoveredDevices(time.Now())
+			case <-d.discoverRefresh:
+				pending = true
+				if refreshReady {
+					running = false
+				}
+			case <-cooldown.C:
+				refreshReady = true
+				if pending {
+					running = false
 				}
 			}
-			d.devices = devices
-			sort.Slice(d.devices, func(i, j int) bool {
-				return d.devices[i].IP < d.devices[j].IP
-			})
 		}
-		d.mu.Unlock()
-		if err != nil {
-			log.Printf("[daemon] mDNS browse error: %v", err)
+		epoch.Stop()
+		cooldown.Stop()
+		expiry.Stop()
+		cancel()
+		if !finished {
+			browseErr = <-done
 		}
+		if browseErr != nil && ctx.Err() == nil {
+			log.Printf("[daemon] mDNS browse error: %v", browseErr)
+			// Avoid a busy retry loop if interfaces or both backends fail.
+			timer := time.NewTimer(time.Second)
+			select {
+			case <-ctx.Done():
+			case <-timer.C:
+			}
+			timer.Stop()
+		}
+	}
+}
 
-		// Next scan starts immediately (no extra wait — the 5s scan is the cadence)
-		if ctx.Err() != nil {
+func (d *Daemon) updateDiscoveredDevice(event airplay.DiscoveryEvent, now time.Time) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	ip := event.Device.IP
+	if event.Removed {
+		delete(d.deviceLastSeen, ip)
+		for i, dev := range d.devices {
+			if dev.IP == ip {
+				d.devices = append(d.devices[:i], d.devices[i+1:]...)
+				break
+			}
+		}
+		return
+	}
+	if d.deviceLastSeen == nil {
+		d.deviceLastSeen = make(map[string]time.Time)
+	}
+	d.deviceLastSeen[ip] = now
+	for i, dev := range d.devices {
+		if dev.IP == ip {
+			d.devices[i] = event.Device
 			return
 		}
 	}
+	d.devices = append(d.devices, event.Device)
+	sort.Slice(d.devices, func(i, j int) bool { return d.devices[i].IP < d.devices[j].IP })
+}
+
+func (d *Daemon) expireDiscoveredDevices(now time.Time) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	kept := d.devices[:0]
+	for _, dev := range d.devices {
+		if now.Sub(d.deviceLastSeen[dev.IP]) <= 30*time.Second {
+			kept = append(kept, dev)
+		} else {
+			delete(d.deviceLastSeen, dev.IP)
+		}
+	}
+	d.devices = kept
 }
 
 func (d *Daemon) handleConn(conn net.Conn) {
@@ -714,6 +771,10 @@ func restoreSavedPairing(client *airplay.AirPlayClient, saved *airplay.SavedCred
 }
 
 func (d *Daemon) handleDiscover() Response {
+	select {
+	case d.discoverRefresh <- struct{}{}:
+	default:
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return Response{

@@ -166,6 +166,19 @@ You can also install from the AUR:
 - [`doubletake-git`](https://aur.archlinux.org/packages/doubletake-git) (latest from git)
 - [`doubletake-bin`](https://aur.archlinux.org/packages/doubletake-bin) (prebuilt binary package)
 
+### Receiver discovery
+
+The daemon publishes receivers as soon as they resolve. When Avahi is running,
+it uses Avahi's D-Bus service and shared mDNS cache; otherwise it falls back to
+native mDNS without requiring an additional daemon. On Arch Linux, the optional
+`avahi` package supplies this service (`avahi-daemon.service`).
+
+`doubletake-ctl discover` returns the current cache immediately and requests a
+background refresh. Repeated requests are coalesced, with at most one browse
+restart every five seconds. `doubletake-ctl devices` reads the cache without
+requesting a refresh. Discovery continues in the background, processes service
+removals, and expires receivers not observed for thirty seconds.
+
 ### Receiver timing compatibility
 
 When a receiver selected for PTP omits `timingPeerInfo` or its `ClockID`,

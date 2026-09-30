@@ -8,6 +8,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/grandcat/zeroconf"
 )
@@ -75,45 +76,79 @@ func (f *FeatureSet) UnmarshalPlist(unmarshal func(interface{}) error) error {
 	return nil
 }
 
-// DiscoverAirPlayDevices browses the local network for AirPlay receivers.
+// DiscoverAirPlayDevices collects incremental results for callers that want a
+// complete snapshot at their deadline (the CLI). The daemon uses BrowseAirPlayDevices.
 func DiscoverAirPlayDevices(ctx context.Context) ([]AirPlayDevice, error) {
+	devices := make(map[string]AirPlayDevice)
+	err := BrowseAirPlayDevices(ctx, func(event DiscoveryEvent) {
+		if event.Removed {
+			delete(devices, event.Device.IP)
+		} else {
+			devices[event.Device.IP] = event.Device
+		}
+	})
+	result := make([]AirPlayDevice, 0, len(devices))
+	for _, dev := range devices {
+		result = append(result, dev)
+	}
+	return result, err
+}
+
+// DiscoveryEvent reports a resolved receiver or the removal of its last service.
+// Browse invokes callbacks serially, and never after returning.
+type DiscoveryEvent struct {
+	Device  AirPlayDevice
+	Removed bool
+}
+
+// BrowseAirPlayDevices prefers the system resolver's shared mDNS cache. Avahi
+// is optional: unavailable or failed service browsing falls back to native mDNS.
+func BrowseAirPlayDevices(ctx context.Context, emit func(DiscoveryEvent)) error {
+	return browseWithFallback(ctx, emit, browseAvahi, browseNative)
+}
+
+type discoveryBrowser func(context.Context, func(DiscoveryEvent)) error
+
+func browseWithFallback(ctx context.Context, emit func(DiscoveryEvent), avahi, native discoveryBrowser) error {
+	if err := avahi(ctx, emit); err == nil || ctx.Err() != nil {
+		return nil
+	} else {
+		dbg("[DISCOVERY] Avahi unavailable (%v); using native mDNS", err)
+	}
+	for ctx.Err() == nil {
+		scan, cancel := context.WithTimeout(ctx, 5*time.Second)
+		err := native(scan, emit)
+		cancel()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func browseNative(ctx context.Context, emit func(DiscoveryEvent)) error {
 	ifaces, traffic, err := airPlayMDNSInterfaces()
 	if err != nil {
-		return nil, fmt.Errorf("mDNS interfaces: %w", err)
+		return fmt.Errorf("mDNS interfaces: %w", err)
 	}
 	if len(ifaces) == 0 {
-		return nil, nil
+		<-ctx.Done()
+		return nil
 	}
-
-	resolver, err := zeroconf.NewResolver(
-		zeroconf.SelectIfaces(ifaces),
-		zeroconf.SelectIPTraffic(traffic),
-	)
+	resolver, err := zeroconf.NewResolver(zeroconf.SelectIfaces(ifaces), zeroconf.SelectIPTraffic(traffic))
 	if err != nil {
-		return nil, fmt.Errorf("zeroconf resolver: %w", err)
+		return fmt.Errorf("zeroconf resolver: %w", err)
 	}
-
 	entries := make(chan *zeroconf.ServiceEntry, 16)
-	var devices []AirPlayDevice
-
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		for entry := range entries {
-			dev := parseServiceEntry(entry)
-			if dev != nil {
-				devices = append(devices, *dev)
-			}
-		}
-	}()
-
 	if err := resolver.Browse(ctx, "_airplay._tcp", "local.", entries); err != nil {
-		return nil, fmt.Errorf("browse: %w", err)
+		return fmt.Errorf("browse: %w", err)
 	}
-
-	<-ctx.Done()
-	<-done
-	return devices, nil
+	for entry := range entries {
+		if dev := parseServiceEntry(entry); dev != nil && ctx.Err() == nil {
+			emit(DiscoveryEvent{Device: *dev})
+		}
+	}
+	return nil
 }
 
 func airPlayMDNSInterfaces() ([]net.Interface, zeroconf.IPType, error) {
