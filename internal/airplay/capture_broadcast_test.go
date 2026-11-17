@@ -211,8 +211,8 @@ func TestBroadcastSinkNominalDurationUsesConfiguredFrameRate(t *testing.T) {
 		acceptedFrames  int
 		rejectedOrdinal int
 	}{
-		{fps: 20, acceptedFrames: 5, rejectedOrdinal: 6},
-		{fps: 60, acceptedFrames: 15, rejectedOrdinal: 16},
+		{fps: 20, acceptedFrames: 40, rejectedOrdinal: 41},
+		{fps: 60, acceptedFrames: 120, rejectedOrdinal: 121},
 	} {
 		t.Run(fmt.Sprintf("%dfps", test.fps), func(t *testing.T) {
 			broadcast := NewBroadcastCaptureWithFrameRate(nil, test.fps)
@@ -364,7 +364,7 @@ func TestBackpressuredByteBroadcastHandoff(t *testing.T) {
 
 func TestLoneSharedTimestampedSinkDoesNotBackpressureCapture(t *testing.T) {
 	base := time.Now()
-	frames := make([]VideoAccessUnit, 12)
+	frames := make([]VideoAccessUnit, 90)
 	for i := range frames {
 		frames[i] = VideoAccessUnit{
 			AnnexB: []byte{byte(i + 1)},
@@ -425,7 +425,7 @@ func TestTimestampedSlowSinkDoesNotStallHealthyPeer(t *testing.T) {
 	}()
 
 	base := time.Now()
-	for i := 0; i < 12; i++ {
+	for i := 0; i < 90; i++ {
 		want := VideoAccessUnit{
 			AnnexB: []byte{byte(i + 1)},
 			PTS:    base.Add(time.Duration(i) * time.Second / 30),
@@ -850,6 +850,7 @@ func TestBroadcastCaptureClosesSinkAddedAfterSourceStops(t *testing.T) {
 func TestSharedSinkToleratesEncoderBurstButBoundsStalledReceiver(t *testing.T) {
 	broadcast := NewBroadcastCaptureWithFrameRate(nil, 30)
 	healthy, stalled := broadcast.AddSink(), broadcast.AddSink()
+	stalled.maxFrameQueueDuration = 250 * time.Millisecond
 	defer healthy.Close()
 	defer stalled.Close()
 	for burst := 0; burst < 3; burst++ {
@@ -872,5 +873,39 @@ func TestSharedSinkToleratesEncoderBurstButBoundsStalledReceiver(t *testing.T) {
 				t.Fatalf("frame dropped/reordered: %v %v", frame, err)
 			}
 		}
+	}
+}
+
+// A sub-second socket stall must not detach a receiver before its two-second
+// network write deadline. Catch up in order, then verify a truly stalled reader
+// still hits a finite duration bound at both supported frame rates.
+func TestSharedSinkRecoversFromTransientNetworkStall(t *testing.T) {
+	for _, fps := range []int{30, 60} {
+		t.Run(fmt.Sprint(fps), func(t *testing.T) {
+			bc := NewBroadcastCaptureWithFrameRate(nil, fps)
+			sink := bc.AddSink()
+			defer sink.Close()
+			for i := 0; i < fps; i++ {
+				if err := sink.enqueueFrame(VideoAccessUnit{AnnexB: []byte{byte(i)}}); err != nil {
+					t.Fatalf("one-second stall disconnected at frame %d: %v", i, err)
+				}
+			}
+			for i := 0; i < fps; i++ {
+				frame, err := sink.ReadVideoAccessUnit()
+				if err != nil || frame.AnnexB[0] != byte(i) {
+					t.Fatalf("catch-up lost/reordered frame %d: %v %v", i, frame, err)
+				}
+			}
+			for i := 0; i < 3*fps; i++ {
+				err := sink.enqueueFrame(VideoAccessUnit{AnnexB: []byte{1}})
+				if errors.Is(err, errBroadcastSinkBacklog) {
+					return
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			t.Fatal("stalled receiver exceeded the bounded write grace period")
+		})
 	}
 }

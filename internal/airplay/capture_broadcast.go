@@ -20,11 +20,12 @@ const (
 	// metadata; it is deliberately generous for normal H.264 buffer cadence.
 	broadcastSinkQueueChunks = 4096
 
-	// Shared readers must tolerate encoder output arriving in short bursts.
-	// The 67ms presentation margin only holds two frames at 30fps; a healthy
-	// VA-API encoder can deliver three before the reader is scheduled. This is
-	// a queue ceiling, not added playback delay. Slow peers remain bounded.
-	broadcastSinkFrameQueueDuration = 250 * time.Millisecond
+	// A receiver's video socket may block for two seconds before its write
+	// deadline expires. The relay must tolerate that same transient stall;
+	// a shorter duration budget disconnects healthy receivers before the
+	// network layer can recover. This ceiling adds no delay to a draining
+	// queue. Byte and chunk bounds still cap memory independently.
+	broadcastSinkFrameQueueDuration = 2 * time.Second
 
 	// Source shutdown normally races with consumers draining their last few
 	// buffers. Do not let a receiver that stopped reading keep Run alive forever.
