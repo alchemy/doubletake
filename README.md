@@ -598,3 +598,15 @@ does not establish hardware capture compatibility on every arm64 system.
 For maintainers, `bash scripts/build-release.sh VERSION ARCH [OUTPUT_DIR]`
 builds the same archive layout locally. Tag-triggered CI tests the source,
 builds both architectures, and publishes the archives and checksums.
+
+### Capture correction for rotated native buffers
+
+For Wayland mirror capture that arrives in the display's unrotated native
+orientation, `DOUBLETAKE_CAPTURE_DIRECTION=90r`, `180`, or `90l` applies an
+explicit correction before scaling. Unset/unrecognized values use identity.
+Do not enable this if the compositor already supplies upright frames. Extended
+desktops ignore the correction.
+
+The VA-API path rotates in `vapostproc`, preserving its GPU surfaces and scaling
+path. Software capture uses `videoflip` before the idle compositor and swaps its
+canvas dimensions for quarter turns. No hardware model or monitor name is used.

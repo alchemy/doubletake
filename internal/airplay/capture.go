@@ -915,6 +915,31 @@ func buildVAWaylandVideoPipeline(fd int, nodeID uint32, fps int, encoder encoder
 	return appendGstVideoEncoding(args, encoder, timestampedOutput)
 }
 
+// withVARotation keeps rotation in the same GPU pass as scaling/conversion.
+func withVARotation(args []string, direction string) []string {
+	for i, arg := range args {
+		if arg == "vapostproc" {
+			result := append([]string(nil), args[:i+1]...)
+			result = append(result, "video-direction="+direction)
+			return append(result, args[i+1:]...)
+		}
+	}
+	return args
+}
+
+// captureRotation corrects native portrait buffers only for mirrored capture.
+func captureRotation(cfg CaptureConfig) string {
+	if cfg.ExtendSize != "" {
+		return "identity"
+	}
+	switch direction := os.Getenv("DOUBLETAKE_CAPTURE_DIRECTION"); direction {
+	case "90l", "90r", "180":
+		return direction
+	default:
+		return "identity"
+	}
+}
+
 func startPreparedWaylandCapture(ctx context.Context, cfg CaptureConfig, encoderParts encoderResult, nodeID uint32, pwFd *os.File, dbusConn *dbus.Conn, streamSize [2]int, timestampedOutput bool) (*ScreenCapture, error) {
 	if pwFd == nil || dbusConn == nil {
 		if pwFd != nil {
@@ -941,15 +966,22 @@ func startPreparedWaylandCapture(ctx context.Context, cfg CaptureConfig, encoder
 	// The encoded dimensions are capped to the receiver's advertised display size
 	// when available. The actual result is read back from the codec SPS downstream.
 	const pwFdNum = 3
+	direction := captureRotation(cfg)
+	if direction == "90l" || direction == "90r" {
+		streamSize[0], streamSize[1] = streamSize[1], streamSize[0]
+	}
 	var gstArgs []string
 	if len(encoderParts.parts) > 0 && encoderParts.parts[0] == "vah264enc" && hasGstElement("vapostproc") {
-		gstArgs = buildVAWaylandVideoPipeline(pwFdNum, nodeID, fps, encoderParts, cfg.MaxWidth, cfg.MaxHeight, timestampedOutput)
+		gstArgs = withVARotation(buildVAWaylandVideoPipeline(pwFdNum, nodeID, fps, encoderParts, cfg.MaxWidth, cfg.MaxHeight, timestampedOutput), direction)
 	} else {
 		source := pipeWireVideoSourceStage(pwFdNum, nodeID, fps)
 
 		hasCompositor := streamSize[0] > 0 && streamSize[1] > 0 && hasGstElement("compositor")
 
 		var beforeConvert []gstStage
+		if direction != "identity" {
+			beforeConvert = append(beforeConvert, gstStage{"videoconvert"}, gstStage{"videoflip", "video-direction=" + direction})
+		}
 		if hasGstElement("vapostproc") {
 			beforeConvert = append(beforeConvert, gstStage{"vapostproc"})
 		} else {
